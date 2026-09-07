@@ -1,0 +1,1215 @@
+{% extends 'base.html' %}
+{% block title %}{{ vm.name }} 详情与监控{% endblock %}
+
+{% block head %}{% endblock %}
+
+{% block content %}
+{% set detail_active_task_type = (active_task_type or "")|lower %}
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem;">
+    <div>
+        <div style="display: flex; align-items: center; gap: 0.75rem;">
+            <h2 style="font-size: 1.4rem; font-weight: 700;">{{ vm.name }}</h2>
+            {% if 'running' in vm.power_state.lower() %}
+                <span class="badge badge-success">运行中</span>
+            {% elif 'deallocated' in vm.power_state.lower() or 'stopped' in vm.power_state.lower() %}
+                <span class="badge badge-secondary">已停止</span>
+            {% else %}
+                <span class="badge badge-warning">{{ vm.power_state }}</span>
+            {% endif %}
+        </div>
+        <span style="color: var(--text-muted); font-size: 0.85rem;">
+            资源组: <code>{{ vm.resource_group }}</code> | 地域: {{ vm.location }} | 规格: <strong>{{ vm.vm_size }}</strong>
+        </span>
+    </div>
+    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;" id="vm-detail-actions">
+        <a href="{{ url_for('vms_page', sub_id=subscription.id) }}" class="btn btn-outline">&larr; 返回列表</a>
+
+        <!-- 运维模态框触发按钮 -->
+        {% if 'running' in vm.power_state.lower() %}
+        <button type="button" id="top-btn-reset-cred" class="btn btn-outline" onclick="openModal('reset-cred-modal')">重置凭据</button>
+        {% else %}
+        <button type="button" id="top-btn-reset-cred" class="btn btn-outline disabled-locked" disabled title="虚拟机未处于运行状态，无法通过 Azure VMAccess 扩展重置凭据 (需先开机)">重置凭据 (需开机)</button>
+        {% endif %}
+        <button type="button" id="top-btn-reinstall" class="btn btn-outline" onclick="openReinstallModal()">重装系统</button>
+        <button type="button" id="top-btn-resize" class="btn btn-outline" onclick="openResizeModal()">调整规格</button>
+        {% if detail_active_task_type == "start" or ("running" not in vm.power_state.lower() and detail_active_task_type not in ["stop", "restart"]) %}
+        <button type="button" id="top-btn-start" class="btn btn-primary" onclick="openModal('start-vm-modal')">开机</button>
+        {% else %}
+        <button type="button" id="top-btn-restart" class="btn btn-outline" onclick="openModal('restart-vm-modal')">重启</button>
+        <button type="button" id="top-btn-stop" class="btn btn-warning" onclick="openModal('stop-vm-modal')">关机</button>
+        {% endif %}
+
+        <button type="button" id="top-btn-delete" class="btn btn-danger" onclick="openModal('delete-vm-modal')">销毁</button>
+    </div>
+</div>
+
+<!-- 网络概要信息卡片 -->
+<div class="stats-grid">
+    <div class="stat-box">
+        <span class="stat-label">公网 IPv4</span>
+        <span class="stat-value" style="font-size: 1.25rem; color: #0284c7; word-break: break-all;">{{ vm.public_ip }}</span>
+        <div style="margin-top: 0.75rem;">
+            <button type="button" id="btn-open-change-ip" class="btn btn-outline btn-sm" style="width: 100%;" onclick="openModal('change-ip-modal')">更换公网 IP</button>
+        </div>
+    </div>
+    <div class="stat-box">
+        <span class="stat-label">内网私有 IP</span>
+        <span class="stat-value" style="font-size: 1.25rem; word-break: break-all;">{{ vm.private_ip }}</span>
+        <div style="margin-top: 0.75rem; font-size: 0.8rem; color: var(--text-muted); word-break: break-all;">
+            网卡: <code>{{ vm.nic_name }}</code>
+        </div>
+    </div>
+    <div class="stat-box">
+        <span class="stat-label">操作系统</span>
+        <span class="stat-value" style="font-size: 1.15rem; word-break: break-word;">{{ vm.os_type }}</span>
+        <div style="margin-top: 0.75rem; font-size: 0.8rem; color: var(--text-muted); word-break: break-all;" title="{{ vm.image_ref }}">
+            镜像: <code>{{ vm.image_ref }}</code>
+        </div>
+    </div>
+    <div class="stat-box">
+        <span class="stat-label">网络安全组 (NSG)</span>
+        <span class="stat-value" style="font-size: 1.15rem; word-break: break-all;">{{ vm.nsg_name }}</span>
+        <div style="margin-top: 0.75rem;">
+            {% if vm.nsg_name != '-' %}
+            <a id="btn-open-firewall" href="{{ url_for('vm_firewall', sub_id=subscription.id, resource_group=vm.resource_group, nsg_name=vm.nsg_name, vm_name=vm.name) }}" class="btn btn-outline btn-sm" style="width: 100%;">防火墙规则</a>
+            {% else %}
+            <span style="font-size: 0.8rem; color: var(--text-muted);">未绑定 NSG</span>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<!-- 性能监控图表区域 (Chart.js) -->
+<div class="card">
+    <div class="card-title">
+        <span>实时性能监控 (Azure Monitor 原生指标) <span id="metrics-spinner" style="display: none; font-size: 0.8rem; font-weight: normal; color: var(--primary); margin-left: 0.5rem;">正在加载中...</span></span>
+        <div style="display: flex; gap: 0.5rem;">
+            <button class="btn btn-outline btn-sm active" id="btn-m-1" onclick="switchMetricsTime(1)">近 1 小时</button>
+            <button class="btn btn-outline btn-sm" id="btn-m-6" onclick="switchMetricsTime(6)">近 6 小时</button>
+            <button class="btn btn-outline btn-sm" id="btn-m-24" onclick="switchMetricsTime(24)">近 24 小时</button>
+        </div>
+    </div>
+
+    <div class="charts-grid">
+        <div class="chart-card">
+            <div class="chart-header">
+                <span class="chart-title">CPU 使用率 (%)</span>
+            </div>
+            <div class="chart-canvas-box">
+                <canvas id="cpuChart"></canvas>
+            </div>
+        </div>
+        <div class="chart-card">
+            <div class="chart-header">
+                <span class="chart-title">可用内存 (GB)</span>
+            </div>
+            <div class="chart-canvas-box">
+                <canvas id="memChart"></canvas>
+            </div>
+        </div>
+        <div class="chart-card">
+            <div class="chart-header">
+                <span class="chart-title">网络上下行速率 (KB/s)</span>
+                <span id="net-totals" class="chart-subtext"></span>
+            </div>
+            <div class="chart-canvas-box">
+                <canvas id="netChart"></canvas>
+            </div>
+        </div>
+        <div class="chart-card">
+            <div class="chart-header">
+                <span class="chart-title">磁盘读写吞吐 (KB/s)</span>
+            </div>
+            <div class="chart-canvas-box">
+                <canvas id="diskChart"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ==================== 各项操作模态弹窗 ==================== -->
+
+<!-- 1. 在线重置凭据 Modal 弹窗 -->
+<div id="reset-cred-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 540px;">
+        <div class="modal-header">
+            <div class="modal-title">在线重置管理员凭据 (免重启生效)</div>
+            <button type="button" class="modal-close" onclick="closeModal('reset-cred-modal')">&times;</button>
+        </div>
+        <form id="form-reset-cred" method="post" action="{{ url_for('vm_reset_credentials', sub_id=subscription.id, resource_group=vm.resource_group, vm_name=vm.name) }}">
+            <input type="hidden" name="os_type" value="{{ vm.os_type }}">
+            <input type="hidden" name="auth_mode" id="reset-auth-mode" value="{{ vm.auth_mode }}">
+
+            <div class="form-group">
+                <label class="form-label">管理员用户名</label>
+                <div style="display: flex; gap: 0.5rem;">
+                    <select class="form-control" onchange="if(this.value){ document.getElementById('reset-username-input').value = this.value; document.getElementById('reset-custom-user-box').style.display='none'; } else { document.getElementById('reset-custom-user-box').style.display='block'; }">
+                        {% for u in vm.detected_users %}
+                        <option value="{{ u }}" {% if u == vm.admin_username %}selected{% endif %}>现有用户: {{ u }}</option>
+                        {% endfor %}
+                        <option value="">-- 指定其他用户名 --</option>
+                    </select>
+                </div>
+                <div id="reset-custom-user-box" style="display: none; margin-top: 0.35rem;">
+                    <input type="text" name="username" id="reset-username-input" class="form-control" value="{{ vm.admin_username }}" placeholder="输入用户名" required>
+                </div>
+            </div>
+
+            {% if vm.auth_mode == 'ssh_key' %}
+            <div class="form-group" id="reset-cred-field-container">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem;">
+                    <label class="form-label" style="margin-bottom: 0;" id="cred-input-label">新 SSH 公钥 (当前系统为 SSH 认证)</label>
+                    <button type="button" class="btn btn-outline btn-sm" style="font-size: 0.75rem; padding: 0.15rem 0.4rem;" onclick="switchResetMode()">切换为密码模式</button>
+                </div>
+                <textarea name="credential_input" id="reset-cred-field" class="form-control" rows="4" placeholder="ssh-rsa AAAA..." required></textarea>
+                <div id="reset-pwd-confirm-box" style="display: none; margin-top: 0.5rem;">
+                    <label class="form-label" style="font-size: 0.82rem; color: var(--text-muted);">确认新登录密码</label>
+                    <input type="password" id="reset-cred-field-confirm" class="form-control" placeholder="请再次输入新登录密码确认">
+                </div>
+            </div>
+            {% else %}
+            <div class="form-group" id="reset-cred-field-container">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem;">
+                    <label class="form-label" style="margin-bottom: 0;" id="cred-input-label">新登录密码 (当前系统为密码认证)</label>
+                    <button type="button" class="btn btn-outline btn-sm" style="font-size: 0.75rem; padding: 0.15rem 0.4rem;" onclick="switchResetMode()">切换为 SSH 模式</button>
+                </div>
+                <input type="password" name="credential_input" id="reset-cred-field" class="form-control" placeholder="设置新登录密码" required>
+                <div id="reset-pwd-confirm-box" style="margin-top: 0.5rem;">
+                    <label class="form-label" style="font-size: 0.82rem; color: var(--text-muted);">确认新登录密码</label>
+                    <input type="password" id="reset-cred-field-confirm" class="form-control" placeholder="请再次输入新登录密码确认" required>
+                </div>
+            </div>
+            {% endif %}
+
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('reset-cred-modal')">取消</button>
+                <button type="submit" class="btn btn-primary">确认重置</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- 2. 换盘重装系统 Modal 弹窗 -->
+<div id="reinstall-modal" class="modal-overlay" data-dropdown-flow="down" style="display: none;">
+    <div class="modal-content" style="max-width: 580px;">
+        <div class="modal-header">
+            <div class="modal-title">换盘重装系统 (保留 IP 与网卡)</div>
+            <button type="button" class="modal-close" onclick="closeModal('reinstall-modal')">&times;</button>
+        </div>
+        <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem; background: #f8fafc; padding: 0.5rem 0.75rem; border-radius: 6px; border: 1px solid var(--border-color); font-weight: 500;">
+            采用事务模式换盘：创建新盘并挂载原网卡，成功后安全删除旧盘，失败自动回滚恢复原系统。
+        </div>
+        <form id="form-reinstall" method="post" action="{{ url_for('vm_reinstall', sub_id=subscription.id, resource_group=vm.resource_group, vm_name=vm.name) }}">
+            <div class="form-group">
+                <label class="form-label">目标系统镜像 (<span id="reinstall-architecture-label">{{ "ARM64" if vm_is_arm else "x64" }}</span>) <span id="reinstall-image-loading" style="font-size: 0.75rem; color: var(--primary);">探测中...</span></label>
+                <select name="image" id="reinstall-image-select" class="form-control" disabled required>
+                    <option value="">正在读取当前地域镜像缓存...</option>
+                </select>
+                <input type="hidden" name="image_architecture" id="reinstall-image-architecture" value="{{ "arm64" if vm_is_arm else "x64" }}">
+                <div id="reinstall-image-error" style="display: none; margin-top: 0.4rem; color: var(--danger); font-size: 0.8rem;"></div>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">管理员用户名</label>
+                <div style="display: flex; gap: 0.5rem;">
+                    <select class="form-control" onchange="if(this.value){ document.getElementById('reinstall-admin-user-input').value = this.value; document.getElementById('reinstall-custom-user-box').style.display='none'; } else { document.getElementById('reinstall-custom-user-box').style.display='block'; }">
+                        {% for u in vm.detected_users %}
+                        <option value="{{ u }}" {% if u == vm.admin_username %}selected{% endif %}>沿用原管理员: {{ u }}</option>
+                        {% endfor %}
+                        <option value="">-- 自定义新用户名 --</option>
+                    </select>
+                </div>
+                <div id="reinstall-custom-user-box" style="display: none; margin-top: 0.35rem;">
+                    <input type="text" name="admin_username" id="reinstall-admin-user-input" class="form-control" value="{{ vm.admin_username }}" placeholder="输入管理员用户名" required>
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 1rem; margin-bottom: 0.75rem; font-size: 0.85rem;">
+                <label style="display: flex; align-items: center; gap: 0.25rem; cursor: pointer;">
+                    <input type="radio" name="reinstall_auth_type" value="password" checked onchange="toggleReinstallAuthType(this.value)"> 密码认证
+                </label>
+                <label style="display: flex; align-items: center; gap: 0.25rem; cursor: pointer;">
+                    <input type="radio" name="reinstall_auth_type" value="ssh_key" onchange="toggleReinstallAuthType(this.value)"> SSH 公钥 (Linux)
+                </label>
+            </div>
+
+            <div class="form-group" id="reinstall-password-box">
+                <label class="form-label">重装后登录密码</label>
+                <input type="password" name="admin_password" id="reinstall-password-input" class="form-control" placeholder="输入重装后的新密码" required>
+                <div style="margin-top: 0.5rem;">
+                    <label class="form-label" style="font-size: 0.82rem; color: var(--text-muted);">确认重装后登录密码</label>
+                    <input type="password" id="reinstall-password-confirm" class="form-control" placeholder="请再次输入重装后的登录密码确认" required>
+                </div>
+            </div>
+
+            <div class="form-group" id="reinstall-ssh-box" style="display: none;">
+                <label class="form-label">重装后 SSH 公钥</label>
+                <textarea name="ssh_public_key" id="reinstall-ssh-input" class="form-control" rows="3" placeholder="ssh-rsa AAAA..."></textarea>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">初始化脚本模板 (Cloud-Init 预设)</label>
+                <select name="script_id" class="form-control">
+                    <option value="">-- 不使用初始化脚本 (默认) --</option>
+                    {% for sc in all_scripts %}
+                    <option value="{{ sc.id }}">{{ sc.name }}{% if sc.description %} ({{ sc.description }}){% endif %}</option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('reinstall-modal')">取消</button>
+                <button type="submit" id="reinstall-submit-btn" class="btn btn-danger" disabled>执行换盘重装</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- 3. 调整虚拟机规格 Modal 弹窗 -->
+<div id="resize-vm-modal" class="modal-overlay" data-dropdown-flow="down" style="display: none;">
+    <div class="modal-content" style="max-width: 620px;">
+        <div class="modal-header">
+            <div class="modal-title">调整虚拟机规格</div>
+            <button type="button" class="modal-close" onclick="closeModal('resize-vm-modal')">&times;</button>
+        </div>
+        <form id="form-resize-vm" method="post" action="{{ url_for('vm_resize', sub_id=subscription.id, resource_group=vm.resource_group, vm_name=vm.name) }}">
+            <div id="resize-options-meta" style="display: none; margin-bottom: 0.65rem; color: var(--text-muted); font-size: 0.78rem;"></div>
+            <div id="resize-options-error" class="alert alert-danger" style="display: none; margin-bottom: 0.75rem;"></div>
+            <div class="form-group" id="resize-options-field" style="display: none;">
+                <label class="form-label" for="resize-size-select">目标规格</label>
+                <select name="target_vm_size" id="resize-size-select" class="form-control" data-custom-dropdown style="display: none;" disabled required>
+                    <option value="">等待规格加载完成...</option>
+                </select>
+                <div class="custom-dropdown-container" id="resize-size-custom-dropdown">
+                    <div class="custom-dropdown-btn" id="resize-size-dropdown-btn" onclick="toggleResizeDropdown(event)" role="button" tabindex="0">
+                        <span id="resize-size-dropdown-label">等待规格加载完成...</span>
+                        <svg viewBox="0 0 24 24" style="width: 14px; height: 14px; fill: var(--text-muted); flex-shrink: 0;"><path d="M7 10l5 5 5-5z"/></svg>
+                    </div>
+                    <div class="custom-dropdown-menu" id="resize-size-dropdown-menu">
+                        <div class="custom-dropdown-item disabled">等待规格加载完成...</div>
+                    </div>
+                </div>
+                <div id="resize-current-size" style="margin-top: 0.4rem; color: var(--text-muted); font-size: 0.8rem;"></div>
+                <div class="azure-form-status" id="resize-options-loading" style="display: none;"><span class="spec-loading-spinner" aria-hidden="true"></span><span class="spec-loading-label">加载中...</span></div>
+            </div>
+
+            <div style="margin-top: 1rem; padding: 0.75rem; border: 1px solid #f59e0b; border-radius: 6px; background: #fffbeb; color: #92400e; font-size: 0.82rem; line-height: 1.6;">
+                <strong>风险提示</strong>
+                <div>调整规格期间虚拟机将停机；临时磁盘中的数据将丢失；动态公网 IP 地址可能发生变化。</div>
+                <div>原状态为 Running 的虚拟机将在调整成功后自动启动。</div>
+            </div>
+
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('resize-vm-modal')">取消</button>
+                <button type="submit" id="resize-submit-btn" class="btn btn-primary" disabled>确认调整规格</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- 4. 更换公网 IP Modal 弹窗 -->
+<div id="change-ip-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 500px;">
+        <div class="modal-header">
+            <div class="modal-title">更换公网 IP 地址</div>
+            <button type="button" class="modal-close" onclick="closeModal('change-ip-modal')">&times;</button>
+        </div>
+        <div style="color: var(--text-main); font-size: 0.9rem; margin-bottom: 1rem;">
+            当前公网 IP: <code style="font-weight: 600; color: var(--primary);">{{ vm.public_ip }}</code>
+            <p style="margin-top: 0.5rem; color: var(--text-muted); font-size: 0.85rem;">
+                确认后系统将向 Azure 申请全新分配的静态 Standard 公网 IPv4 并热重绑到当前网卡，释放原有旧 IP。
+            </p>
+        </div>
+        <form id="form-change-ip" method="post" action="{{ url_for('vm_change_ip', sub_id=subscription.id, resource_group=vm.resource_group, vm_name=vm.name) }}">
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('change-ip-modal')">取消</button>
+                <button type="submit" class="btn btn-primary">确认更换新 IP</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- 5. 重启虚拟机 Modal 弹窗 -->
+<div id="restart-vm-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 500px;">
+        <div class="modal-header">
+            <div class="modal-title">重启虚拟机确认</div>
+            <button type="button" class="modal-close" onclick="closeModal('restart-vm-modal')">&times;</button>
+        </div>
+        <div style="color: var(--text-main); font-size: 0.9rem; margin-bottom: 1rem;">
+            确定要重启虚拟机 <strong>{{ vm.name }}</strong> 吗？
+            <p style="margin-top: 0.5rem; color: var(--text-muted); font-size: 0.85rem;">
+                重启操作将向操作系统发送软重启信号，期间网络连接将短暂中断。
+            </p>
+        </div>
+        <form id="form-restart-vm" method="post" action="{{ url_for('vm_action', sub_id=subscription.id, resource_group=vm.resource_group, vm_name=vm.name, action_type='restart') }}">
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('restart-vm-modal')">取消</button>
+                <button type="submit" class="btn btn-primary">确认重启</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- 6. 关机虚拟机 Modal 弹窗 -->
+<div id="stop-vm-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 500px;">
+        <div class="modal-header">
+            <div class="modal-title">停止并解除分配 (关机释放计费)</div>
+            <button type="button" class="modal-close" onclick="closeModal('stop-vm-modal')">&times;</button>
+        </div>
+        <div style="color: var(--text-main); font-size: 0.9rem; margin-bottom: 1rem;">
+            确定要停止并解除分配虚拟机 <strong>{{ vm.name }}</strong> 吗？
+            <p style="margin-top: 0.5rem; color: var(--text-muted); font-size: 0.85rem;">
+                停止后虚拟机将进入 <code>Deallocated</code> 状态，计算资源将立即<strong>停止产生每小时计费</strong>。
+            </p>
+        </div>
+        <form id="form-stop-vm" method="post" action="{{ url_for('vm_action', sub_id=subscription.id, resource_group=vm.resource_group, vm_name=vm.name, action_type='stop') }}">
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('stop-vm-modal')">取消</button>
+                <button type="submit" class="btn btn-warning">确认关机并停止计费</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- 7. 开机启动 Modal 弹窗 -->
+<div id="start-vm-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 500px;">
+        <div class="modal-header">
+            <div class="modal-title">开机启动确认</div>
+            <button type="button" class="modal-close" onclick="closeModal('start-vm-modal')">&times;</button>
+        </div>
+        <div style="color: var(--text-main); font-size: 0.9rem; margin-bottom: 1rem;">
+            确定要启动虚拟机 <strong>{{ vm.name }}</strong> 吗？
+        </div>
+        <form id="form-start-vm" method="post" action="{{ url_for('vm_action', sub_id=subscription.id, resource_group=vm.resource_group, vm_name=vm.name, action_type='start') }}">
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('start-vm-modal')">取消</button>
+                <button type="submit" class="btn btn-primary">确认开机</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- 8. 销毁虚拟机 Modal 弹窗 -->
+<div id="delete-vm-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 500px;">
+        <div class="modal-header">
+            <div class="modal-title" style="color: var(--danger);">销毁虚拟机确认</div>
+            <button type="button" class="modal-close" onclick="closeModal('delete-vm-modal')">&times;</button>
+        </div>
+        <div style="font-size: 0.92rem; line-height: 1.6; color: var(--text-main); margin-bottom: 1.25rem;">
+            确定要彻底销毁虚拟机 <strong>{{ vm.name }}</strong> 吗？
+            <p style="margin-top: 0.6rem; margin-bottom: 0; color: var(--danger); font-size: 0.82rem; font-weight: 500;">
+                此操作不可逆，将彻底销毁该虚拟机及其所属资源组 <code>{{ vm.resource_group }}</code> 下的系统盘、网卡与公网 IP 等全部关联资源。
+            </p>
+        </div>
+        <form id="form-delete-vm" method="post" action="{{ url_for('vm_action', sub_id=subscription.id, resource_group=vm.resource_group, vm_name=vm.name, action_type='delete') }}">
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('delete-vm-modal')">取消</button>
+                <button type="submit" class="btn btn-danger">确认销毁</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+const VM_DETAIL_SUB_ID = {{ subscription.id|tojson }};
+const VM_DETAIL_NAME = {{ vm.name|tojson }};
+const VM_DETAIL_RESOURCE_GROUP = {{ vm.resource_group|tojson }};
+let cpuChart, memChart, netChart, diskChart;
+let isLoadingMetrics = false;
+
+function getTopButtonByTaskType(taskType) {
+    const t = (taskType || '').toLowerCase();
+    if (t === 'restart' || t === '重启') return { btn: document.getElementById('top-btn-restart'), label: '重启中...' };
+    if (t === 'stop' || t === '关机') return { btn: document.getElementById('top-btn-stop'), label: '关机中...' };
+    if (t === 'start' || t === '开机') return { btn: document.getElementById('top-btn-start'), label: '开机中...' };
+    if (t === 'delete' || t === '销毁') return { btn: document.getElementById('top-btn-delete'), label: '销毁中...' };
+    if (t === 'reinstall' || t === '重装系统' || t === '换盘重装') return { btn: document.getElementById('top-btn-reinstall'), label: '重装中...' };
+    if (t === 'resize' || t === '调整规格') return { btn: document.getElementById('top-btn-resize'), label: '调整规格中...' };
+    if (t === 'reset_credentials' || t === '重置凭据') return { btn: document.getElementById('top-btn-reset-cred'), label: '重置中...' };
+    if (t === 'change_ip' || t === '更换公网 ip') return { btn: document.getElementById('btn-open-change-ip'), label: '换绑中...' };
+    return null;
+}
+
+function bindModalFormAjax(formId, modalId, taskType) {
+    const form = document.getElementById(formId);
+    if (!form) return;
+    form.onsubmit = function(e) {
+        e.preventDefault();
+
+        // 1. 重置凭据二次密码确认校验
+        if (formId === 'form-reset-cred') {
+            const authMode = document.getElementById('reset-auth-mode').value;
+            if (authMode !== 'ssh_key') {
+                const p1 = document.getElementById('reset-cred-field').value;
+                const p2 = document.getElementById('reset-cred-field-confirm').value;
+                if (p1 !== p2) {
+                    showTopAlert('重置凭据两次输入的新密码不一致，请核对！', 'danger');
+                    document.getElementById('reset-cred-field-confirm').focus();
+                    return;
+                }
+            }
+        }
+
+        // 2. 换盘重装二次密码确认校验
+        if (formId === 'form-reinstall') {
+            const rAuth = document.querySelector('input[name="reinstall_auth_type"]:checked')?.value || 'password';
+            if (rAuth === 'password') {
+                const p1 = document.getElementById('reinstall-password-input').value;
+                const p2 = document.getElementById('reinstall-password-confirm').value;
+                if (p1 !== p2) {
+                    showTopAlert('换盘重装两次输入的新密码不一致，请核对！', 'danger');
+                    document.getElementById('reinstall-password-confirm').focus();
+                    return;
+                }
+            }
+        }
+
+        const submitBtn = form.querySelector('button[type="submit"]');
+        const origLabel = submitBtn ? submitBtn.textContent : '确认';
+        if (submitBtn) {
+            setButtonBusy(submitBtn, true, "提交中...", null);
+        showTopAlert("已开始执行虚拟机操作，进度可在活动通知查看。", "info");
+        }
+
+        const allActionBtns = document.querySelectorAll('#vm-detail-actions button, #btn-open-change-ip, #btn-open-firewall');
+        allActionBtns.forEach(b => {
+            b.disabled = true;
+            b.classList.add('disabled-locked');
+            if (b.tagName === 'A') b.setAttribute('aria-disabled', 'true');
+        });
+
+        const targetInfo = getTopButtonByTaskType(taskType);
+        const targetOriginalLabel = targetInfo && targetInfo.btn ? targetInfo.btn.textContent : '';
+        if (targetInfo && targetInfo.btn) {
+            if (targetInfo.btn.tagName === 'A') {
+                targetInfo.btn.setAttribute('aria-disabled', 'true');
+                targetInfo.btn.classList.add('disabled-locked');
+            } else {
+                targetInfo.btn.classList.remove('disabled-locked');
+            }
+            targetInfo.btn.innerHTML = buttonBusyMarkup(targetInfo.label);
+        }
+        // 提交后立即同步左上角状态徽章，无需等待任务接口返回或手动刷新。
+        applyDetailTaskState({ task_type: taskType, status: 'Pending' });
+
+        const formData = new FormData(form);
+        fetch(form.action, {
+            method: 'POST',
+            body: formData,
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRF-Token': '{{ csrf_token }}' }
+        })
+        .then(res => res.json().then(data => ({ ok: res.ok, data })))
+        .then(({ ok, data }) => {
+            const isAcceptedTask = data.status === 'submitted' || data.status === 'in_progress';
+            if (!ok || !isAcceptedTask || !data.task_id) {
+                throw new Error(data.message || '虚拟机操作提交失败');
+            }
+            if (data.status === 'in_progress') {
+                showTopAlert(data.message || '该虚拟机已有操作正在执行，已继续跟踪当前任务。', 'info');
+            }
+            // 重复请求可能复用另一种正在执行的操作，以服务端返回的任务类型为准。
+            applyDetailTaskState({ task_type: data.task_type || taskType, status: 'Pending' });
+            setTimeout(() => {
+                closeModal(modalId);
+                if (submitBtn) {
+                    setButtonBusy(submitBtn, false, '', origLabel);
+                }
+                startWatchingTask(VM_DETAIL_NAME, data.task_type || taskType, data.task_id, function(success, task) {
+                    if (!success) {
+                        allActionBtns.forEach(b => { b.disabled = false; b.classList.remove('disabled-locked'); });
+                        allActionBtns.forEach(b => { if (b.tagName === 'A') b.removeAttribute('aria-disabled'); });
+                        sessionStorage.setItem("pending_top_alert", JSON.stringify({ msg: "虚拟机操作失败，请查看活动通知。", type: "danger" }));
+                        setTimeout(() => location.reload(), 600);
+                        return;
+                    }
+                    sessionStorage.setItem("pending_top_alert", JSON.stringify({ msg: "虚拟机操作已完成。", type: "success" }));
+                    location.reload();
+                });
+            }, 120);
+        })
+        .catch(err => {
+            console.error("Modal action error:", err);
+            closeModal(modalId);
+            if (submitBtn) {
+                setButtonBusy(submitBtn, false, '', origLabel);
+            }
+            allActionBtns.forEach(b => {
+                b.disabled = false;
+                b.classList.remove('disabled-locked');
+                if (b.tagName === 'A') b.removeAttribute('aria-disabled');
+            });
+            if (targetInfo && targetInfo.btn) {
+                setButtonBusy(targetInfo.btn, false, '', targetOriginalLabel);
+            }
+            showTopAlert('虚拟机操作请求失败：' + (err.message || '网络连接异常，请稍后重试'), 'danger');
+        });
+    };
+}
+
+function bindAllModalForms() {
+    bindModalFormAjax('form-reset-cred', 'reset-cred-modal', 'reset_credentials');
+    bindModalFormAjax('form-reinstall', 'reinstall-modal', 'reinstall');
+    bindModalFormAjax('form-resize-vm', 'resize-vm-modal', 'resize');
+    bindModalFormAjax('form-change-ip', 'change-ip-modal', 'change_ip');
+    bindModalFormAjax('form-restart-vm', 'restart-vm-modal', 'restart');
+    bindModalFormAjax('form-stop-vm', 'stop-vm-modal', 'stop');
+    bindModalFormAjax('form-start-vm', 'start-vm-modal', 'start');
+    bindModalFormAjax('form-delete-vm', 'delete-vm-modal', 'delete');
+}
+
+let resizeOptionsRequest = null;
+let resizeOptionsReady = false;
+
+function formatResizeSizeMb(value) {
+    const sizeGb = Number(value || 0) / 1024;
+    return Number.isInteger(sizeGb) ? sizeGb.toString() : sizeGb.toFixed(1);
+}
+
+function groupResizeSizes(sizes) {
+    const recommended = new Set([
+        'Standard_B1s', 'Standard_B1ms', 'Standard_B2s', 'Standard_B2ms',
+        'Standard_B2ats_v2', 'Standard_D2s_v3', 'Standard_D2s_v5'
+    ]);
+    const groupDefinitions = [
+        { label: '常用推荐 (Recommended)', match: size => recommended.has(size.name) },
+        { label: 'B 系列 - 突发性能 (高性价比)', match: size => size.name.startsWith('Standard_B') },
+        { label: 'D 系列 - 通用计算型', match: size => size.name.startsWith('Standard_D') || size.name.startsWith('Standard_DC') },
+        { label: 'E 系列 - 内存优化型', match: size => size.name.startsWith('Standard_E') || size.name.startsWith('Standard_EC') },
+        { label: 'F 系列 - 计算优化型', match: size => size.name.startsWith('Standard_F') },
+        { label: '其他可用规格', match: () => true },
+    ];
+    const groups = groupDefinitions.map(definition => ({ label: definition.label, items: [] }));
+
+    sizes.forEach(size => {
+        const groupIndex = groupDefinitions.findIndex(definition => definition.match(size));
+        if (groupIndex >= 0) groups[groupIndex].items.push(size);
+    });
+    return groups.filter(group => group.items.length > 0);
+}
+
+function formatResizeSizeLabel(size, currentSize) {
+    const isCurrent = size.name.toLowerCase() === currentSize.toLowerCase();
+    const monthly = formatMonthlyPrice(size);
+    return `${size.name}${isCurrent ? '（当前规格）' : ''} · ${size.vcpus ?? size.number_of_cores ?? '-'} vCPU · ${size.memory_gib ?? formatResizeSizeMb(size.memory_in_mb)} GiB · ${monthly}`;
+}
+
+function formatMonthlyPrice(size) {
+    const value = size?.monthly_price;
+    if (value === null || value === undefined || value === '') return '月度价格暂无';
+    const numeric = Number(value);
+    return Number.isFinite(numeric)
+        ? `${size.currency || 'USD'} ${numeric.toFixed(2)}/月`
+        : '月度价格暂无';
+}
+
+function formatResizeSizeDetails(size) {
+    const details = [
+        `架构：${size.architecture || '未知'}`,
+        `临时磁盘：${size.temp_disk_gib ?? formatResizeSizeMb(size.resource_disk_size_in_mb)} GiB`,
+        `系统盘上限：${size.os_disk_gib ?? formatResizeSizeMb(size.os_disk_size_in_mb)} GiB`,
+        `最大数据盘：${size.max_data_disk_count ?? '-'}`,
+        `最大网卡：${size.max_nics ?? '-'}`,
+        `可用 vCPU：${size.vcpus_available ?? size.vcpus ?? size.number_of_cores ?? '-'}`,
+        `GPU：${size.gpu_count ?? 0}`,
+        `RDMA：${size.rdma_enabled ? '支持' : '不支持'}`,
+        `Premium SSD：${size.premium_io ? '支持' : '不支持'}`,
+        `网络加速：${size.accelerated_networking_supported ? '支持' : '不支持'}`,
+        `Spot：${size.spot_capable ? '支持' : '不支持'}`,
+        `Hyper-V：${(size.hyperv_generations || []).join('、') || '-'}`,
+        `可用区：${(size.availability_zones || []).join('、') || '-'}`,
+    ];
+    if (size.restriction_reasons && size.restriction_reasons.length) {
+        details.push(`限制：${size.restriction_reasons.join('、')}`);
+    }
+    if (size.display_only) details.push('仅用于显示，Azure 当前未将其列入本机可调整集合');
+    return details.join('；');
+}
+
+function toggleResizeDropdown(event) {
+    if (event) event.stopPropagation();
+    const dropdown = document.getElementById('resize-size-custom-dropdown');
+    const select = document.getElementById('resize-size-select');
+    if (!dropdown || !select || select.disabled) return;
+    dropdown.classList.toggle('open');
+    if (dropdown.classList.contains('open')) scrollResizeDropdownToSelected();
+}
+
+function scrollResizeDropdownToSelected() {
+    const menu = document.getElementById('resize-size-dropdown-menu');
+    if (!menu || !menu.querySelector) return;
+    const selectedItem = menu.querySelector('.custom-dropdown-item.selected');
+    if (!selectedItem) return;
+    const visibleHeight = menu.clientHeight || 0;
+    const itemHeight = selectedItem.offsetHeight || 0;
+    menu.scrollTop = Math.max(0, selectedItem.offsetTop - Math.max(0, (visibleHeight - itemHeight) / 2));
+}
+
+function setResizeDropdownState(disabled, labelText) {
+    const dropdown = document.getElementById('resize-size-custom-dropdown');
+    const button = document.getElementById('resize-size-dropdown-btn');
+    const label = document.getElementById('resize-size-dropdown-label');
+    const menu = document.getElementById('resize-size-dropdown-menu');
+    if (button) {
+        button.style.pointerEvents = disabled ? 'none' : '';
+        button.style.opacity = disabled ? '0.65' : '';
+    }
+    if (label && labelText !== undefined) label.textContent = labelText;
+    if (menu && disabled) menu.innerHTML = '';
+    if (dropdown && disabled) dropdown.classList.remove('open');
+}
+
+function openResizeModal() {
+    openModal('resize-vm-modal');
+    if (resizeOptionsReady || resizeOptionsRequest) return;
+
+    const loading = document.getElementById('resize-options-loading');
+    const meta = document.getElementById('resize-options-meta');
+    const errorBox = document.getElementById('resize-options-error');
+    const field = document.getElementById('resize-options-field');
+    const select = document.getElementById('resize-size-select');
+    const dropdown = document.getElementById('resize-size-custom-dropdown');
+    const dropdownLabel = document.getElementById('resize-size-dropdown-label');
+    const dropdownMenu = document.getElementById('resize-size-dropdown-menu');
+    const currentLabel = document.getElementById('resize-current-size');
+    const submit = document.getElementById('resize-submit-btn');
+
+    if (loading) loading.style.display = 'inline';
+    if (meta) meta.style.display = 'none';
+    if (errorBox) { errorBox.style.display = 'none'; errorBox.textContent = ''; }
+    if (field) field.style.display = 'block';
+    // 加载期间保持规格选择框可见且可展开，提交按钮单独锁定，避免把“加载中”误显示成不可用。
+    if (select) { select.disabled = false; select.innerHTML = '<option value="">等待规格加载完成...</option>'; }
+    if (dropdown) dropdown.classList.remove('open');
+    if (dropdownMenu) dropdownMenu.innerHTML = '';
+    setResizeDropdownState(false, '等待规格加载完成...');
+    if (dropdownMenu) dropdownMenu.innerHTML = '<div class="custom-dropdown-item disabled">等待规格加载完成...</div>';
+    if (submit) submit.disabled = true;
+
+    resizeOptionsRequest = fetch(`/api/sub/${VM_DETAIL_SUB_ID}/vm/${encodeURIComponent(VM_DETAIL_RESOURCE_GROUP)}/${encodeURIComponent(VM_DETAIL_NAME)}/resize_options`, { cache: 'no-store' })
+        .then(res => res.json().then(data => {
+            if (!res.ok || data.status !== 'success') {
+                throw new Error(data.message || '读取可调整规格失败');
+            }
+            return data;
+        }))
+        .then(data => {
+            const sourceLabel = data.source === 'azure' ? 'Azure 短时缓存' : (data.source || '未知');
+            const cachedAt = data.cached_at ? new Date(Number(data.cached_at) * 1000).toLocaleString('zh-CN') : '未知';
+            if (meta) {
+                meta.textContent = `规格来源：${sourceLabel} · 缓存时间：${cachedAt}`;
+                meta.style.display = 'block';
+            }
+
+            if (!data.supported) {
+                if (errorBox) {
+                    errorBox.textContent = data.unsupported_reason || '当前虚拟机不支持调整规格';
+                    errorBox.style.display = 'block';
+                }
+                if (select) {
+                    select.innerHTML = '';
+                    select.disabled = true;
+                }
+                if (field) field.style.display = 'none';
+                setResizeDropdownState(true, '当前虚拟机不支持调整规格');
+                resizeOptionsReady = true;
+                return;
+            }
+
+            const sizes = Array.isArray(data.sizes) ? data.sizes : [];
+            const currentSize = data.current_size || '';
+            const targetSizes = sizes.filter(size =>
+                size.name && size.name.toLowerCase() !== currentSize.toLowerCase() && size.selectable !== false
+            );
+            const hasSelectableTarget = targetSizes.length > 0;
+            const hasRestrictedDisplay = sizes.some(size => size.selectable === false);
+            if (!hasSelectableTarget) {
+                if (errorBox) {
+                    errorBox.textContent = hasRestrictedDisplay
+                        ? '当前没有可选择的目标规格；受限规格仍保留展示，不能提交'
+                        : '该虚拟机没有可用的目标规格';
+                    errorBox.style.display = 'block';
+                }
+                if (!hasRestrictedDisplay) {
+                    if (select) {
+                        select.innerHTML = '';
+                        select.disabled = true;
+                    }
+                    if (field) field.style.display = 'none';
+                    setResizeDropdownState(true, '该虚拟机没有可用的目标规格');
+                    resizeOptionsReady = true;
+                    return;
+                }
+            }
+
+            if (select) {
+                select.innerHTML = '';
+                if (dropdownMenu) dropdownMenu.innerHTML = '';
+                groupResizeSizes(sizes).forEach(group => {
+                    const titleDiv = document.createElement('div');
+                    titleDiv.className = 'custom-dropdown-group-title';
+                    titleDiv.textContent = group.label;
+                    if (dropdownMenu) dropdownMenu.appendChild(titleDiv);
+
+                    group.items.forEach(size => {
+                        const option = document.createElement('option');
+                        option.value = size.name;
+                        const isCurrent = size.name.toLowerCase() === currentSize.toLowerCase();
+                        option.textContent = formatResizeSizeLabel(size, currentSize);
+                        option.selected = isCurrent;
+                        option.disabled = size.selectable === false;
+                        select.appendChild(option);
+
+                        if (dropdownMenu) {
+                            const item = document.createElement('div');
+                            const disabled = size.selectable === false;
+                            item.className = `custom-dropdown-item${isCurrent ? ' selected' : ''}${disabled ? ' disabled' : ''}`;
+                            item.textContent = option.textContent;
+                            item.title = formatResizeSizeDetails(size);
+                            item.onclick = event => {
+                                event.stopPropagation();
+                                if (disabled) return;
+                                select.value = size.name;
+                                if (dropdownLabel) dropdownLabel.textContent = item.textContent;
+                                dropdownMenu.querySelectorAll('.custom-dropdown-item').forEach(el => el.classList.remove('selected'));
+                                item.classList.add('selected');
+                                if (dropdown) dropdown.classList.remove('open');
+                                if (submit) submit.disabled = select.value.toLowerCase() === currentSize.toLowerCase();
+                            };
+                            dropdownMenu.appendChild(item);
+                            if (isCurrent && dropdownLabel) dropdownLabel.textContent = item.textContent;
+                        }
+                    });
+                });
+                select.disabled = false;
+                setResizeDropdownState(false, hasSelectableTarget ? undefined : '仅有受限规格');
+                select.onchange = () => {
+                    if (submit) submit.disabled = select.value.toLowerCase() === currentSize.toLowerCase();
+                };
+            }
+            if (currentLabel) currentLabel.textContent = `当前规格：${currentSize}`;
+            if (field) field.style.display = 'block';
+            if (submit) submit.disabled = !select || select.value.toLowerCase() === currentSize.toLowerCase();
+            resizeOptionsReady = true;
+        })
+        .catch(err => {
+            if (errorBox) {
+                errorBox.textContent = err.message || '读取可调整规格失败';
+                errorBox.style.display = 'block';
+            }
+            if (field) field.style.display = 'none';
+            if (select) select.disabled = true;
+            setResizeDropdownState(true, '规格加载失败');
+        })
+        .finally(() => {
+            resizeOptionsRequest = null;
+            if (loading) loading.style.display = 'none';
+        });
+}
+
+function switchResetMode() {
+    const hiddenAuthMode = document.getElementById('reset-auth-mode');
+    const fieldContainer = document.getElementById('reset-cred-field-container');
+    const label = document.getElementById('cred-input-label');
+    const confirmBox = document.getElementById('reset-pwd-confirm-box');
+    const confirmInput = document.getElementById('reset-cred-field-confirm');
+
+    if (hiddenAuthMode.value === 'ssh_key') {
+        hiddenAuthMode.value = 'password';
+        label.textContent = '新登录密码 (手动切换为密码模式)';
+        fieldContainer.querySelector('button').textContent = '切换为 SSH 模式';
+        const oldField = document.getElementById('reset-cred-field');
+        const input = document.createElement('input');
+        input.type = 'password';
+        input.name = 'credential_input';
+        input.id = 'reset-cred-field';
+        input.className = 'form-control';
+        input.placeholder = '设置新登录密码';
+        input.required = true;
+        oldField.replaceWith(input);
+        if (confirmBox) confirmBox.style.display = 'block';
+        if (confirmInput) confirmInput.required = true;
+    } else {
+        hiddenAuthMode.value = 'ssh_key';
+        label.textContent = '新 SSH 公钥 (手动切换为 SSH 模式)';
+        fieldContainer.querySelector('button').textContent = '切换为密码模式';
+        const oldField = document.getElementById('reset-cred-field');
+        const textarea = document.createElement('textarea');
+        textarea.name = 'credential_input';
+        textarea.id = 'reset-cred-field';
+        textarea.className = 'form-control';
+        textarea.rows = 4;
+        textarea.placeholder = 'ssh-rsa AAAA...';
+        textarea.required = true;
+        oldField.replaceWith(textarea);
+        if (confirmBox) confirmBox.style.display = 'none';
+        if (confirmInput) confirmInput.required = false;
+    }
+}
+
+let reinstallImagesRequest = null;
+let reinstallImagesReady = false;
+
+function openReinstallModal() {
+    openModal("reinstall-modal");
+    const select = document.getElementById("reinstall-image-select");
+    const submit = document.getElementById("reinstall-submit-btn");
+    const loading = document.getElementById("reinstall-image-loading");
+    const errorBox = document.getElementById("reinstall-image-error");
+    let location = null;
+    let architecture = null;
+
+    if (reinstallImagesReady || reinstallImagesRequest) return;
+    if (select) {
+        select.disabled = true;
+        select.innerHTML = '<option value="">正在读取当前地域镜像缓存...</option>';
+    }
+    if (submit) submit.disabled = true;
+    if (loading) loading.style.display = "inline";
+    if (errorBox) { errorBox.style.display = "none"; errorBox.textContent = ""; }
+
+    reinstallImagesRequest = fetch(`/api/sub/${VM_DETAIL_SUB_ID}/vm/${encodeURIComponent(VM_DETAIL_RESOURCE_GROUP)}/${encodeURIComponent(VM_DETAIL_NAME)}/reinstall_metadata`, { cache: "no-store" })
+        .then(res => res.json().then(data => {
+            if (!res.ok || data.status !== "success") {
+                throw new Error(data.message || "读取当前虚拟机规格失败");
+            }
+            return data;
+        }))
+        .then(metadata => {
+            location = metadata.location;
+            architecture = metadata.architecture;
+            const architectureLabel = document.getElementById("reinstall-architecture-label");
+            if (architectureLabel) architectureLabel.textContent = architecture.toUpperCase();
+            const archInput = document.getElementById("reinstall-image-architecture");
+            if (archInput) archInput.value = architecture;
+            return fetch(`/api/sub/${VM_DETAIL_SUB_ID}/images/${encodeURIComponent(location)}?architecture=${encodeURIComponent(architecture)}`, { cache: "no-store" });
+        })
+        .then(res => res.json().then(data => {
+            if (!res.ok || data.status !== "success") {
+                throw new Error(data.message || "镜像缓存读取失败");
+            }
+            return data;
+        }))
+        .then(data => {
+            const images = (data.images && data.images[architecture]) || [];
+            if (!images.length) {
+                throw new Error(`未探测到当前地域可用的 ${architecture.toUpperCase()} 镜像，禁止回退到其他架构`);
+            }
+            if (select) {
+                select.innerHTML = "";
+                images.forEach(image => {
+                    const option = document.createElement("option");
+                    option.value = image.urn;
+                    option.textContent = image.name;
+                    select.appendChild(option);
+                });
+                select.disabled = false;
+            }
+            const archInput = document.getElementById("reinstall-image-architecture");
+            if (archInput) archInput.value = architecture;
+            if (submit) submit.disabled = false;
+            reinstallImagesReady = true;
+        })
+        .catch(err => {
+            if (select) {
+                select.innerHTML = '<option value="">镜像探测失败，无法提交</option>';
+                select.disabled = true;
+            }
+            if (submit) submit.disabled = true;
+            if (errorBox) {
+                errorBox.textContent = err.message || "镜像缓存读取失败";
+                errorBox.style.display = "block";
+            }
+        })
+        .finally(() => {
+            reinstallImagesRequest = null;
+            if (loading) loading.style.display = "none";
+        });
+}
+
+function toggleReinstallAuthType(val) {
+    const pwdBox = document.getElementById('reinstall-password-box');
+    const sshBox = document.getElementById('reinstall-ssh-box');
+    const pwdInput = document.getElementById('reinstall-password-input');
+    const pwdConfirmInput = document.getElementById('reinstall-password-confirm');
+    const sshInput = document.getElementById('reinstall-ssh-input');
+
+    if (val === 'password') {
+        pwdBox.style.display = 'block';
+        if (sshBox) sshBox.style.display = 'none';
+        pwdInput.required = true;
+        if (pwdConfirmInput) pwdConfirmInput.required = true;
+        if (sshInput) sshInput.required = false;
+    } else {
+        pwdBox.style.display = 'none';
+        if (sshBox) sshBox.style.display = 'block';
+        pwdInput.required = false;
+        if (pwdConfirmInput) pwdConfirmInput.required = false;
+        if (sshInput) sshInput.required = true;
+    }
+}
+
+function initCharts() {
+    const commonOpts = {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        elements: {
+            point: { radius: 1, hitRadius: 5 },
+            line: { tension: 0.1, borderWidth: 2 }
+        },
+        plugins: {
+            legend: { display: true, position: 'top', labels: { boxWidth: 12, font: { size: 11 } } },
+            tooltip: { enabled: true }
+        },
+        scales: {
+            x: { grid: { display: false }, ticks: { maxTicksLimit: 8, font: { size: 10 } } },
+            y: { beginAtZero: true, ticks: { font: { size: 10 } } }
+        }
+    };
+
+    if (cpuChart) cpuChart.destroy();
+    if (memChart) memChart.destroy();
+    if (netChart) netChart.destroy();
+    if (diskChart) diskChart.destroy();
+
+    cpuChart = new Chart(document.getElementById('cpuChart'), {
+        type: 'line',
+        data: { labels: [], datasets: [{ label: 'CPU %', data: [], borderColor: '#0284c7', backgroundColor: 'rgba(2,132,199,0.08)', fill: true }] },
+        options: commonOpts
+    });
+
+    memChart = new Chart(document.getElementById('memChart'), {
+        type: 'line',
+        data: { labels: [], datasets: [{ label: '可用内存 (GB)', data: [], borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.08)', fill: true }] },
+        options: commonOpts
+    });
+
+    netChart = new Chart(document.getElementById('netChart'), {
+        type: 'line',
+        data: { labels: [], datasets: [
+            { label: '进 (KB/s)', data: [], borderColor: '#06b6d4' },
+            { label: '出 (KB/s)', data: [], borderColor: '#8b5cf6' }
+        ] },
+        options: commonOpts
+    });
+
+    diskChart = new Chart(document.getElementById('diskChart'), {
+        type: 'line',
+        data: { labels: [], datasets: [
+            { label: '读 (KB/s)', data: [], borderColor: '#f59e0b' },
+            { label: '写 (KB/s)', data: [], borderColor: '#ef4444' }
+        ] },
+        options: commonOpts
+    });
+}
+
+function switchMetricsTime(hours) {
+    [1, 6, 24].forEach(h => {
+        const b = document.getElementById(`btn-m-${h}`);
+        if (b) {
+            if (h === hours) {
+                b.classList.add('active');
+            } else {
+                b.classList.remove('active');
+            }
+        }
+    });
+    loadMetrics(hours);
+}
+
+function loadMetrics(hours = 1) {
+    if (isLoadingMetrics) return;
+    isLoadingMetrics = true;
+    const spinner = document.getElementById('metrics-spinner');
+    if (spinner) spinner.style.display = 'inline';
+
+    fetch(`/api/sub/${VM_DETAIL_SUB_ID}/vm/${encodeURIComponent(VM_DETAIL_RESOURCE_GROUP)}/${encodeURIComponent(VM_DETAIL_NAME)}/metrics?hours=${encodeURIComponent(hours)}`)
+        .then(res => {
+            if (!res.ok) throw new Error("Network response was not ok");
+            return res.json();
+        })
+        .then(res => {
+            isLoadingMetrics = false;
+            if (spinner) spinner.style.display = 'none';
+            if (res.status === 'success' && res.data) {
+                const d = res.data;
+                const labels = d.timestamps || [];
+
+                if (cpuChart) {
+                    cpuChart.data.labels = labels;
+                    cpuChart.data.datasets[0].data = d.cpu || [];
+                    cpuChart.update('none');
+                }
+
+                if (memChart) {
+                    memChart.data.labels = labels;
+                    memChart.data.datasets[0].data = d.memory_available_gb || [];
+                    memChart.update('none');
+                }
+
+                if (netChart) {
+                    netChart.data.labels = labels;
+                    netChart.data.datasets[0].data = d.network_in_rate_kb || [];
+                    netChart.data.datasets[1].data = d.network_out_rate_kb || [];
+                    netChart.update('none');
+                }
+
+                const netTotalEl = document.getElementById('net-totals');
+                if (netTotalEl) {
+                    netTotalEl.textContent = `累计进站: ${d.total_network_in_mb} MB | 累计出站: ${d.total_network_out_mb} MB`;
+                }
+
+                if (diskChart) {
+                    diskChart.data.labels = labels;
+                    diskChart.data.datasets[0].data = d.disk_read_rate_kb || [];
+                    diskChart.data.datasets[1].data = d.disk_write_rate_kb || [];
+                    diskChart.update('none');
+                }
+            }
+        })
+        .catch(err => {
+            isLoadingMetrics = false;
+            if (spinner) spinner.style.display = 'none';
+            console.warn("Failed to load metrics or timed out:", err);
+        });
+}
+
+function applyDetailTaskState(task) {
+    if (!task) return;
+
+    const topBadge = document.querySelector("h2 + .badge");
+    if (topBadge) {
+        let stText = "执行中";
+        const tt = (task.task_type || "").toLowerCase();
+        if (tt === "restart") stText = "重启中";
+        else if (tt === "stop") stText = "关机中";
+        else if (tt === "start") stText = "开机中";
+        else if (tt === "delete") stText = "销毁中";
+        else if (tt === "reinstall") stText = "重装中";
+        else if (tt === "resize") stText = "调整规格中";
+        else if (tt === "reset_credentials") stText = "重置凭据中";
+        else if (tt === "change_ip") stText = "更换IP中";
+        topBadge.className = "badge badge-warning";
+        topBadge.innerHTML = `<svg class="spin status-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg> ${stText}`;
+    }
+
+    const allActionBtns = document.querySelectorAll("#vm-detail-actions button, #btn-open-change-ip, #btn-open-firewall");
+    allActionBtns.forEach(button => {
+        button.disabled = true;
+        button.classList.add("disabled-locked");
+        if (button.tagName === 'A') button.setAttribute('aria-disabled', 'true');
+    });
+    const targetInfo = getTopButtonByTaskType(task.task_type);
+    const busyMarkup = typeof buttonBusyMarkup === "function"
+        ? buttonBusyMarkup
+        : label => `<span class="btn-loading-spinner" aria-hidden="true"></span> ${label}`;
+    if (targetInfo && targetInfo.btn) {
+        if (targetInfo.btn.tagName === 'A') {
+            targetInfo.btn.setAttribute('aria-disabled', 'true');
+            targetInfo.btn.classList.add('disabled-locked');
+        } else {
+            targetInfo.btn.classList.remove("disabled-locked");
+        }
+        targetInfo.btn.disabled = true;
+        targetInfo.btn.innerHTML = busyMarkup(targetInfo.label);
+    }
+}
+
+function startDetailTaskWatcher(task) {
+    if (!task || detailTaskWatcherStarted) return;
+    if (detailTaskRestoreTimer) {
+        clearInterval(detailTaskRestoreTimer);
+        detailTaskRestoreTimer = null;
+    }
+    detailTaskWatcherStarted = true;
+    applyDetailTaskState(task);
+    startWatchingTask(VM_DETAIL_NAME, task.task_type, task.id, function(success, completedTask) {
+        if (!success) {
+            sessionStorage.setItem("pending_top_alert", JSON.stringify({ msg: "虚拟机操作失败，请查看活动通知。", type: "danger" }));
+        } else {
+            sessionStorage.setItem("pending_top_alert", JSON.stringify({ msg: "虚拟机操作已完成。", type: "success" }));
+        }
+        location.reload();
+    }, false);
+}
+
+function reconcileDetailTaskState() {
+    fetch(`/api/tasks/list?sub_id=${VM_DETAIL_SUB_ID}`, { cache: "no-store" })
+        .then(res => res.json())
+        .then(data => {
+            const tasks = data.tasks || [];
+            const currentVmName = VM_DETAIL_NAME.toLowerCase();
+            const matchedTask = tasks.find(task =>
+                (task.target_name || "").toLowerCase() === currentVmName &&
+                (task.resource_group || "").toLowerCase() === VM_DETAIL_RESOURCE_GROUP.toLowerCase() &&
+                (task.status === "InProgress" || task.status === "Pending")
+            );
+            if (matchedTask) {
+                startDetailTaskWatcher(matchedTask);
+            } else {
+                scheduleDetailTaskRestore();
+            }
+        })
+        .catch(err => {
+            console.error("Error checking detail tasks:", err);
+            scheduleDetailTaskRestore();
+        });
+}
+
+function checkAndRestoreDetailRunningTasks() {
+    reconcileDetailTaskState();
+}
+
+function scheduleDetailTaskRestore() {
+    if (detailTaskRestoreTimer || detailTaskWatcherStarted) return;
+    detailTaskRestoreTimer = setInterval(() => {
+        if (detailTaskWatcherStarted) {
+            clearInterval(detailTaskRestoreTimer);
+            detailTaskRestoreTimer = null;
+            return;
+        }
+        reconcileDetailTaskState();
+    }, 1500);
+}
+
+let detailTaskRestoreStarted = false;
+let detailChartsInitialized = false;
+let detailTaskRestoreTimer = null;
+let detailTaskWatcherStarted = false;
+const initialDetailTask = {{ active_task_snapshot|tojson }};
+
+// 服务端任务快照在 DOMContentLoaded 前立即应用，避免普通按钮先闪现再切换为执行中。
+if (initialDetailTask) {
+    applyDetailTaskState(initialDetailTask);
+}
+
+function startInit() {
+    if (!detailTaskRestoreStarted) {
+        detailTaskRestoreStarted = true;
+        bindAllModalForms();
+        if (initialDetailTask) startDetailTaskWatcher(initialDetailTask);
+        else checkAndRestoreDetailRunningTasks();
+    }
+    if (detailChartsInitialized) return;
+    if (typeof Chart === "undefined") {
+        setTimeout(startInit, 50);
+        return;
+    }
+    detailChartsInitialized = true;
+    initCharts();
+    switchMetricsTime(1);
+}
+
+window.addEventListener('DOMContentLoaded', startInit);
+window.addEventListener('resize', () => {
+    if (cpuChart) cpuChart.resize();
+    if (memChart) memChart.resize();
+    if (netChart) netChart.resize();
+    if (diskChart) diskChart.resize();
+});
+</script>
+{% endblock %}

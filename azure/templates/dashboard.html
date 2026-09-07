@@ -1,0 +1,124 @@
+{% extends 'base.html' %}
+{% block title %}仪表盘概览{% endblock %}
+
+{% block content %}
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem;">
+    <div>
+        <h2 style="font-size: 1.35rem; font-weight: 700;">{{ subscription.display_name }}</h2>
+        <span style="color: var(--text-muted); font-size: 0.85rem;">
+            订阅 ID: {{ subscription.subscription_id }} | 状态: <strong style="color: var(--success);">{{ subscription.state }}</strong>
+        </span>
+    </div>
+    <div>
+        <a href="{{ url_for('create_vm', sub_id=subscription.id) }}" class="btn btn-primary">+ 新建虚拟机</a>
+    </div>
+</div>
+
+{% if error_msg %}
+<div class="alert alert-danger">
+    拉取订阅数据遇到异常: {{ error_msg }}
+</div>
+{% endif %}
+
+<!-- 核心指标栅格 -->
+<div class="stats-grid">
+    <div class="stat-box">
+        <span class="stat-label">运行中虚拟机</span>
+        <span class="stat-value" style="color: var(--success);">{{ running_count }}</span>
+    </div>
+    <div class="stat-box">
+        <span class="stat-label">已关机 / 释放</span>
+        <span class="stat-value" style="color: var(--text-muted);">{{ stopped_count }}</span>
+    </div>
+    <div class="stat-box">
+        <span class="stat-label">虚拟机总数</span>
+        <span class="stat-value">{{ vms|length }}</span>
+    </div>
+    <div class="stat-box">
+        <span class="stat-label">本月预估账单</span>
+        <span class="stat-value" style="color: var(--primary);" id="cost-display">
+            <span style="font-size: 1rem; color: var(--text-muted);">正在同步...</span>
+        </span>
+    </div>
+</div>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+    fetch('/api/sub/{{ subscription.id }}/costs')
+        .then(res => res.json())
+        .then(data => {
+            const costEl = document.getElementById('cost-display');
+            if (data.status === 'Success') {
+                const totalCost = Number(data.total_cost);
+                const displayCost = Number.isFinite(totalCost) ? totalCost.toFixed(2) : '-';
+                costEl.innerHTML = `$${displayCost} <span style="font-size: 0.9rem; font-weight: 400; color: var(--text-muted);">${escapeHtml(data.currency)}</span>`;
+            } else if (data.status === 'Warning') {
+                costEl.innerHTML = `<span style="font-size: 0.95rem; color: var(--warning);" title="${escapeHtml(data.message)}">权限受限 (非计费管理员)</span>`;
+            } else {
+                costEl.innerHTML = `<span style="font-size: 0.95rem; color: var(--text-muted);">-</span>`;
+            }
+        })
+        .catch(err => {
+            const costEl = document.getElementById('cost-display');
+            if (costEl) costEl.innerHTML = `<span style="font-size: 0.95rem; color: var(--text-muted);">-</span>`;
+        });
+});
+</script>
+
+<!-- 快速 VM 列表卡片 -->
+<div class="card">
+    <div class="card-title">
+        <span>虚拟机列表</span>
+        <a href="{{ url_for('vms_list', sub_id=subscription.id) }}" class="btn btn-outline btn-sm">查看全部</a>
+    </div>
+
+    {% if not vms %}
+    <div style="text-align: center; padding: 2.5rem; color: var(--text-muted);">
+        当前订阅下暂无虚拟机。<a href="{{ url_for('create_vm', sub_id=subscription.id) }}" style="color: var(--primary);">点击立即创建</a>
+    </div>
+    {% else %}
+    <div class="table-responsive">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>名称 / 资源组</th>
+                    <th>规格 / 区域</th>
+                    <th>公网 IP</th>
+                    <th>状态</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for vm in vms[:5] %}
+                <tr>
+                    <td>
+                        <a href="{{ url_for('vm_detail', sub_id=subscription.id, resource_group=vm.resource_group, vm_name=vm.name) }}" style="font-weight: 600; color: var(--primary); text-decoration: none;">
+                            {{ vm.name }}
+                        </a>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">{{ vm.resource_group }}</div>
+                    </td>
+                    <td>
+                        <div>{{ vm.vm_size }}</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">{{ vm.location }}</div>
+                    </td>
+                    <td><code>{{ vm.public_ip }}</code></td>
+                    <td>
+                        {% if 'running' in vm.power_state.lower() %}
+                            <span class="badge badge-success">运行中</span>
+                        {% elif 'deallocated' in vm.power_state.lower() or 'stopped' in vm.power_state.lower() %}
+                            <span class="badge badge-secondary">已停止</span>
+                        {% else %}
+                            <span class="badge badge-warning">{{ vm.power_state }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <a href="{{ url_for('vm_detail', sub_id=subscription.id, resource_group=vm.resource_group, vm_name=vm.name) }}" class="btn btn-outline btn-sm">管理 / 监控</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

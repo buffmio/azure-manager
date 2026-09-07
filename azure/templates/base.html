@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="zh-CN" style="background-color: #f8fafc; color-scheme: light;">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}控制台{% endblock %} - Azure Manager</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" integrity="sha384-9nhczxUqK87bcKHh20fSQcTGD4qq5GhayNYSYWqwBkINBhOfQLg/P5HG5lF1urn4" crossorigin="anonymous"></script>
+    <script src="{{ url_for('static', filename='ui_controls.js') }}" defer></script>
+    {% block head %}{% endblock %}
+</head>
+<body style="background-color: #f8fafc;">
+    <nav class="navbar">
+        <div class="nav-left">
+            <a href="{{ url_for('index') }}" class="nav-brand">
+                <svg viewBox="0 0 24 24" style="width: 22px; height: 22px; fill: var(--primary);"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg>
+                Azure Manager
+            </a>
+        </div>
+
+        <ul class="nav-links">
+            {% if current_user.is_authenticated %}
+                <li>
+                    <a href="{{ url_for('vms_page') }}" class="nav-link {% if active_module == 'vms' %}active{% endif %}">
+                        <svg viewBox="0 0 24 24" class="nav-icon"><path d="M4 3h16a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm1 2v2h14V5H5zm-1 5h16a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1zm1 2v2h14v-2H5zm-1 5h16a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1zm1 2v2h14v-2H5zM7 6h2v-.01H7V6zm0 7h2v-.01H7V13zm0 7h2v-.01H7V20z"/></svg>
+                        虚拟机
+                    </a>
+                </li>
+                <li>
+                    <a href="{{ url_for('costs_page') }}" class="nav-link {% if active_module == 'costs' %}active{% endif %}">
+                        <svg viewBox="0 0 24 24" class="nav-icon"><path d="M11.8 10.9c-2.27-.59-3-1.2-3-2.15 0-1.09 1.01-1.85 2.7-1.85 1.78 0 2.44.85 2.5 2.1h2.21c-.07-1.72-1.12-3.3-3.21-3.81V3h-3v2.16c-1.94.42-3.5 1.68-3.5 3.61 0 2.31 1.91 3.46 4.7 4.13 2.5.6 3 1.48 3 2.41 0 .69-.49 1.79-2.7 1.79-2.06 0-2.87-.92-2.98-2.1h-2.2c.12 2.19 1.76 3.42 3.68 3.83V21h3v-2.15c1.95-.37 3.5-1.5 3.5-3.55 0-2.84-2.43-3.81-4.7-4.4z"/></svg>
+                        费用
+                    </a>
+                </li>
+                <li>
+                    <a href="{{ url_for('tasks_page') }}" class="nav-link {% if active_module == 'tasks' %}active{% endif %}">
+                        <svg viewBox="0 0 24 24" class="nav-icon"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-5 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/></svg>
+                        活动日志
+                    </a>
+                </li>
+                <li>
+                    <a href="{{ url_for('accounts_page') }}" class="nav-link {% if active_module == 'accounts' %}active{% endif %}">
+                        <svg viewBox="0 0 24 24" class="nav-icon"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM19 18H6c-2.21 0-4-1.79-4-4 0-2.05 1.53-3.76 3.56-3.97l1.07-.11.5-.95C8.08 7.14 9.94 6 12 6c2.62 0 4.88 1.86 5.39 4.43l.3 1.5 1.53.11c1.56.1 2.78 1.41 2.78 2.96 0 1.65-1.35 3-3 3z"/></svg>
+                        云账户
+                    </a>
+                </li>
+                <li>
+                    <a href="{{ url_for('settings_page') }}" class="nav-link {% if active_module == 'settings' %}active{% endif %}">
+                        <svg viewBox="0 0 24 24" class="nav-icon"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+                        设置
+                    </a>
+                </li>
+                <!-- 顶栏活动通知 (带有动态 Badge) -->
+                <li>
+                    <button type="button" class="nav-bell-btn" id="nav-notification-btn" onclick="toggleNotificationDrawer()" title="活动通知">
+                        <svg viewBox="0 0 24 24" class="nav-icon" style="width: 17px; height: 17px;"><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2zm-2 1H8v-6c0-2.48 1.51-4.5 4-4.5s4 2.02 4 4.5v6z"/></svg>
+                        <span id="nav-bell-badge" class="nav-bell-badge" style="display: none;">0</span>
+                    </button>
+                </li>
+                <li>
+                    <form method="post" action="{{ url_for('logout') }}" style="margin: 0;">
+                        <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+                        <button type="submit" class="nav-link" style="color: var(--danger); background: none; border: 0; cursor: pointer;">退出</button>
+                    </form>
+                </li>
+            {% else %}
+                <li><a href="{{ url_for('login') }}" class="nav-link">登录</a></li>
+            {% endif %}
+        </ul>
+    </nav>
+
+    <main class="container">
+        <!-- 页面顶部消息提示容器 (精简居中自适应，告别全屏超长长条) -->
+        <div id="global-flash-box" style="display: flex; flex-direction: column; align-items: center; gap: 0.5rem; margin-bottom: 1.25rem; width: 100%;">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }}">
+                        <span>{{ message }}</span>
+                        <button type="button" class="modal-close" style="font-size: 1.1rem; padding: 0 0.3rem; margin-left: 0.75rem; line-height: 1;" onclick="this.parentElement.remove()">&times;</button>
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+        </div>
+
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="footer">
+        <div>Azure Cloud Infrastructure Manager &copy; {{ now_year if now_year else '2026' }}</div>
+    </footer>
+
+    <!-- ==================== Azure 原生风格右侧滑出式通知抽屉 (Notifications Drawer) ==================== -->
+    <div id="azure-drawer-overlay" class="azure-drawer-overlay" onclick="closeNotificationDrawer()"></div>
+    <div id="azure-drawer" class="azure-drawer">
+        <div class="azure-drawer-header">
+            <div class="azure-drawer-title">
+                <svg viewBox="0 0 24 24" style="width: 18px; height: 18px; fill: var(--primary);"><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2zm-2 1H8v-6c0-2.48 1.51-4.5 4-4.5s4 2.02 4 4.5v6z"/></svg>
+                <span>活动通知 (Activity Notifications)</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <button type="button" class="btn btn-outline btn-xs" style="padding: 0.15rem 0.45rem; font-size: 0.72rem; color: var(--text-muted);" onclick="clearAllNotifications()" title="一键清空所有历史与卡住的活动通知">清空通知</button>
+                <button type="button" class="modal-close" onclick="closeNotificationDrawer()">&times;</button>
+            </div>
+        </div>
+        <div class="azure-drawer-body" id="azure-drawer-body">
+            <div id="drawer-empty-placeholder" style="text-align: center; padding: 3rem 1rem; color: var(--text-muted); font-size: 0.85rem;">
+                暂无近期活动通知
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== 全局通用引擎 ==================== -->
+    <script>
+    const TASK_CHINESE_DICT = {
+        'start': '开机', 'stop': '关机', 'restart': '重启', 'delete': '销毁',
+        'reinstall': '重装系统', 'resize': '调整规格', 'change_ip': '更换公网 IP', 'reset_credentials': '重置凭据',
+        'create': '创建虚拟机', 'firewall_add': '添加规则', 'firewall_delete': '删除规则',
+        'sync_subscriptions': '同步订阅', 'sync_vms': '同步虚拟机列表', 'sync_costs': '刷新费用账单'
+    };
+
+    // 页面顶部消息提示器平滑淡出公共函数 (成功 3.5s，失败/警告 6.0s 充分阅读)
+    function dismissAlertElement(alertEl, duration = 3500) {
+        if (!alertEl) return;
+        setTimeout(() => {
+            alertEl.style.transition = 'opacity 0.4s ease, transform 0.4s ease, max-height 0.4s ease, padding 0.4s ease, margin 0.4s ease';
+            alertEl.style.opacity = '0';
+            alertEl.style.transform = 'translateY(-8px)';
+            alertEl.style.maxHeight = '0';
+            alertEl.style.padding = '0';
+            alertEl.style.margin = '0';
+            alertEl.style.overflow = 'hidden';
+            setTimeout(() => alertEl.remove(), 400);
+        }, duration);
+    }
+
+    // 页面顶部动态消息触发器 (成功绿色 3.5s，失败红色 6.0s)
+    function escapeHtml(value) {
+        const element = document.createElement("span");
+        element.textContent = String(value ?? "");
+        return element.innerHTML;
+    }
+
+    function buttonBusyMarkup(label) {
+        return `<span class="btn-loading-spinner" aria-hidden="true"></span> ${escapeHtml(label || "处理中...")}`;
+    }
+
+    function setButtonBusy(button, busy, busyLabel = "处理中...", idleLabel = "") {
+        if (!button) return;
+        button.disabled = Boolean(busy);
+        button.classList.toggle("disabled-locked", Boolean(busy));
+        if (busy) {
+            button.innerHTML = buttonBusyMarkup(busyLabel);
+        } else if (idleLabel !== null) {
+            button.textContent = idleLabel;
+        }
+    }
+
+    // 原生表单提交前留出一个绘制帧，确保锁定状态和旋转动效可见。
+    function submitFormAfterPaint(form, busyLabel = "处理中...") {
+        if (!form || form.dataset.submitting === "1") return;
+        const button = form.querySelector('button[type="submit"]');
+        form.dataset.submitting = "1";
+        setButtonBusy(button, true, busyLabel, null);
+        window.setTimeout(() => {
+            HTMLFormElement.prototype.submit.call(form);
+        }, 60);
+    }
+
+    function showTopAlert(message, category = 'success') {
+        const box = document.getElementById('global-flash-box');
+        if (!box) return;
+        const alertEl = document.createElement('div');
+        alertEl.className = `alert alert-${category}`;
+        alertEl.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 0; animation: fadeInEffect 0.2s ease;';
+        const messageEl = document.createElement("span"); messageEl.textContent = String(message ?? "");
+        const closeButton = document.createElement("button"); closeButton.type = "button"; closeButton.className = "modal-close"; closeButton.style.cssText = "font-size: 1.1rem; padding: 0 0.3rem; margin-left: 0.5rem; line-height: 1;"; closeButton.textContent = "×"; closeButton.addEventListener("click", () => alertEl.remove());
+        alertEl.append(messageEl, closeButton);
+        box.appendChild(alertEl);
+        const stayDuration = (category === 'danger' || category === 'error') ? 6000 : 3500;
+        dismissAlertElement(alertEl, stayDuration);
+    }
+
+    // 页面加载完成后，自动对服务端渲染的静态 flash 消息启动平滑淡出
+    document.addEventListener("DOMContentLoaded", () => {
+        const staticAlerts = document.querySelectorAll("#global-flash-box .alert");
+        staticAlerts.forEach(alertEl => {
+            const isError = alertEl.classList.contains("alert-danger");
+            dismissAlertElement(alertEl, isError ? 6000 : 3500);
+        });
+        document.querySelectorAll("form[method=\"post\"], form[method=\"POST\"]").forEach(form => {
+            if (form.querySelector("input[name=\"_csrf_token\"]")) return;
+            const input = document.createElement("input");
+            input.type = "hidden";
+            input.name = "_csrf_token";
+            input.value = '{{ csrf_token }}';
+            form.appendChild(input);
+        });
+    });
+
+    document.addEventListener("DOMContentLoaded", () => {
+        const pending = sessionStorage.getItem("pending_top_alert");
+        if (!pending) return;
+        sessionStorage.removeItem("pending_top_alert");
+        try {
+            const item = JSON.parse(pending);
+            showTopAlert(item.msg, item.type || "info");
+        } catch (e) {}
+    });
+
+    function openModal(id) {
+        const m = document.getElementById(id);
+        if (m) m.style.display = 'flex';
+    }
+
+    function closeModal(id) {
+        const m = document.getElementById(id);
+        if (m) m.style.display = 'none';
+    }
+
+    window.addEventListener('click', (e) => {
+        if (e.target.classList.contains('modal-overlay')) {
+            e.target.style.display = 'none';
+        }
+    });
+
+    // 抽屉控制
+    function openNotificationDrawer() {
+        document.getElementById('azure-drawer-overlay').classList.add('open');
+        document.getElementById('azure-drawer').classList.add('open');
+        syncNotificationDrawer();
+    }
+
+    function closeNotificationDrawer() {
+        document.getElementById('azure-drawer-overlay').classList.remove('open');
+        document.getElementById('azure-drawer').classList.remove('open');
+    }
+
+    function toggleNotificationDrawer() {
+        const drawer = document.getElementById('azure-drawer');
+        if (drawer.classList.contains('open')) {
+            closeNotificationDrawer();
+        } else {
+            openNotificationDrawer();
+        }
+    }
+
+    // 关闭抽屉中单条通知卡片 (仅前端移除视图/忽略，绝不删除数据库底层活动日志！)
+    function dismissSingleNotification(taskId, event) {
+        if (event) event.stopPropagation();
+        const dismissedIds = JSON.parse(localStorage.getItem('azure_drawer_dismissed_ids') || '[]');
+        if (!dismissedIds.includes(taskId)) {
+            dismissedIds.push(taskId);
+            localStorage.setItem('azure_drawer_dismissed_ids', JSON.stringify(dismissedIds));
+        }
+        const itemEl = document.getElementById(`drawer-task-item-${taskId}`);
+        if (itemEl) itemEl.remove();
+
+        const drawerBody = document.getElementById('azure-drawer-body');
+        if (drawerBody && drawerBody.querySelectorAll('.azure-task-item').length === 0) {
+            drawerBody.innerHTML = `<div id="drawer-empty-placeholder" style="text-align: center; padding: 3rem 1rem; color: var(--text-muted); font-size: 0.85rem;">暂无近期活动通知</div>`;
+        }
+    }
+
+    // 抽屉内一键清空近期通知 (仅重置前端抽屉视图与已读时间戳，绝不物理删除数据库底层的活动日志！)
+    function clearAllNotifications() {
+        localStorage.setItem('azure_drawer_cleared_ts', Date.now().toString());
+        localStorage.removeItem('azure_drawer_dismissed_ids');
+        const drawerBody = document.getElementById('azure-drawer-body');
+        if (drawerBody) {
+            drawerBody.innerHTML = `<div id="drawer-empty-placeholder" style="text-align: center; padding: 3rem 1rem; color: var(--text-muted); font-size: 0.85rem;">暂无近期活动通知</div>`;
+        }
+        const badge = document.getElementById('nav-bell-badge');
+        if (badge) {
+            badge.style.display = 'none';
+            badge.className = 'nav-bell-badge';
+        }
+        showTopAlert('已清空近期活动通知 (历史日志仍可在【活动日志】中查看)', 'success');
+    }
+
+    // 渲染抽屉内容与更新通知角标
+    function syncNotificationDrawer() {
+        fetch('/api/tasks/list', { cache: 'no-store' })
+            .then(res => res.json())
+            .then(data => {
+                const allTasks = data.tasks || [];
+                const clearedTs = parseInt(localStorage.getItem('azure_drawer_cleared_ts') || '0', 10);
+                const dismissedIds = JSON.parse(localStorage.getItem('azure_drawer_dismissed_ids') || '[]');
+
+                // 筛选云资源核心生命周期任务，成功和失败结果也保留在通知中
+                const drawerSupportedTypes = ['create', 'start', 'stop', 'restart', 'delete', 'reinstall', 'resize', 'change_ip', 'reset_credentials', 'sync_costs', 'sync_subscriptions', 'sync_vms', 'firewall_add', 'firewall_delete'];
+                const tasks = allTasks.filter(t => {
+                    if (dismissedIds.includes(t.id)) return false;
+                    const typeOk = drawerSupportedTypes.includes((t.task_type || '').toLowerCase());
+                    const isActive = (t.status === 'InProgress' || t.status === 'Pending');
+                    const isFailed = (t.status === 'Failed');
+                    const isSuccess = (t.status === 'Succeeded');
+                    const isRecent = !clearedTs || new Date(t.created_at).getTime() >= clearedTs;
+                    return typeOk && (isActive || ((isSuccess || isFailed) && isRecent));
+                });
+
+                const badge = document.getElementById('nav-bell-badge');
+                const drawerBody = document.getElementById('azure-drawer-body');
+
+                const activeTasks = tasks.filter(t => t.status === 'InProgress' || t.status === 'Pending');
+                const failedTasks = tasks.filter(t => t.status === 'Failed');
+                if (badge) {
+                    if (activeTasks.length > 0 || failedTasks.length > 0) {
+                        badge.style.display = 'flex';
+                        badge.textContent = activeTasks.length + failedTasks.length;
+                        badge.className = 'nav-bell-badge badge-running';
+                    } else {
+                        badge.style.display = 'none';
+                        badge.className = 'nav-bell-badge';
+                    }
+                }
+
+                // 原地增量智能排序更新（最新任务永远置顶最上方第一位，且不暴力销毁 DOM 保证进度条动画连贯）
+                // 1. 如果抽屉当前包含暂无通知的空占位，先清除
+                const visibleIds = new Set(tasks.map(t => `drawer-task-item-${t.id}`));
+                drawerBody.querySelectorAll(".azure-task-item").forEach(item => {
+                    if (!visibleIds.has(item.id)) item.remove();
+                });
+
+                const placeholder = document.getElementById('drawer-empty-placeholder');
+                if (placeholder && tasks.length > 0) {
+                    placeholder.remove();
+                }
+
+                // 2. 依次按 tasks 倒序（最新在上）更新或定位插入
+                tasks.slice(0, 15).forEach((t, idx) => {
+                    const isActive = (t.status === 'InProgress' || t.status === 'Pending');
+                    const isSuccess = (t.status === 'Succeeded');
+                    const isFailed = (t.status === 'Failed');
+
+                    let badgeClass = 'badge-warning';
+                    let statusLabel = '进行中';
+                    if (isSuccess) {
+                        badgeClass = 'badge-success';
+                        statusLabel = '已完成';
+                    } else if (isFailed) {
+                        badgeClass = 'badge-danger';
+                        statusLabel = '失败';
+                    }
+
+                    const tType = TASK_CHINESE_DICT[(t.task_type || '').toLowerCase()] || t.task_type;
+                    let existingItem = document.getElementById(`drawer-task-item-${t.id}`);
+
+                    if (existingItem) {
+                        // 局部更新文字，保持 CSS 动画连续
+                        const statusBadge = existingItem.querySelector('.badge');
+                        const msgDiv = existingItem.querySelector('.azure-task-msg');
+                        const progressBox = existingItem.querySelector('.azure-task-progress');
+                        if (statusBadge) {
+                            statusBadge.className = `badge ${badgeClass}`;
+                            statusBadge.textContent = statusLabel;
+                        }
+                        if (msgDiv) msgDiv.textContent = t.progress_msg;
+                        if (!isActive && progressBox) progressBox.remove();
+                    } else {
+                        // 新任务创建并插入到正确顺序位置 (若是最新任务直接置顶 prepend)
+                        existingItem = document.createElement('div');
+                        existingItem.id = `drawer-task-item-${t.id}`;
+                        existingItem.className = 'azure-task-item';
+                        existingItem.innerHTML = `
+                            <div class="azure-task-header">
+                                <span class="azure-task-name">${escapeHtml(t.target_name)} [${escapeHtml(tType)}]</span>
+                                <div style="display: flex; align-items: center; gap: 0.35rem;">
+                                    <span class="badge ${badgeClass}" style="font-size: 0.7rem; padding: 0.15rem 0.4rem;">${statusLabel}</span>
+                                    <button type="button" class="btn-drawer-dismiss" style="background: none; border: none; font-size: 0.95rem; color: var(--text-muted); cursor: pointer; padding: 0 0.2rem; line-height: 1;" title="关闭此卡片 (不删除活动日志)" onclick="dismissSingleNotification(${t.id}, event)">&times;</button>
+                                </div>
+                            </div>
+                            <div class="azure-task-msg">${escapeHtml(t.progress_msg)}</div>
+                            ${t.error_detail ? `<div style="font-size: 0.75rem; color: var(--danger); word-break: break-all; margin-top: 0.25rem;">${escapeHtml(t.error_detail)}</div>` : ''}
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.35rem; font-size: 0.75rem; color: var(--text-muted);">
+                                <span>${escapeHtml(t.created_at)}</span>
+                                <span>${escapeHtml(t.resource_group || "")}</span>
+                            </div>
+                            ${isActive ? `<div class="azure-task-progress"><div class="azure-task-progress-bar"></div></div>` : ''}
+                        `;
+
+                        const currentChildren = drawerBody.children;
+                        if (idx === 0 || currentChildren.length === 0) {
+                            drawerBody.prepend(existingItem);
+                        } else if (idx < currentChildren.length) {
+                            drawerBody.insertBefore(existingItem, currentChildren[idx]);
+                        } else {
+                            drawerBody.appendChild(existingItem);
+                        }
+                    }
+                });
+            })
+            .catch(err => console.error("Drawer sync error:", err));
+    }
+
+    const taskWatchers = new Map();
+
+    function stopWatchingTask(taskId) {
+        const timer = taskWatchers.get(taskId);
+        if (timer) clearInterval(timer);
+        taskWatchers.delete(taskId);
+    }
+
+    // 每个任务独立轮询，避免多个操作互相覆盖进度。
+    function startWatchingTask(targetName, taskType, optTaskId, onFinishCallback, autoOpenDrawer = false) {
+        const taskId = Number.isFinite(Number(optTaskId)) ? Number(optTaskId) : null;
+        const callback = typeof optTaskId === 'function' ? optTaskId : onFinishCallback;
+        if (taskId === null) return;
+
+        stopWatchingTask(taskId);
+        if (autoOpenDrawer) setTimeout(openNotificationDrawer, 180);
+        else syncNotificationDrawer();
+
+        const checkTask = () => {
+            fetch('/api/tasks/list', { cache: 'no-store' })
+                .then(res => {
+                    if (!res.ok) throw new Error('任务状态请求失败 (' + res.status + ')');
+                    return res.json();
+                })
+                .then(data => {
+                    syncNotificationDrawer();
+                    const matched = (data.tasks || []).find(task => task.id === taskId);
+                    if (!matched) return;
+                    if (matched.status === 'InProgress' || matched.status === 'Pending') {
+                        window.dispatchEvent(new CustomEvent('azure-task-progress', { detail: matched }));
+                    }
+                    if (matched.status === 'Succeeded' || matched.status === 'Failed') {
+                        stopWatchingTask(taskId);
+                        if (typeof callback === 'function') {
+                                if (matched.status === 'Failed') callback(false, matched);
+                                else callback(true, matched);
+                            }
+                    }
+                })
+                .catch(err => console.error('Task status polling error:', err));
+        };
+
+        checkTask();
+        taskWatchers.set(taskId, setInterval(checkTask, 1500));
+    }
+
+    // 页面初始化时轮询一次活动通知，仅更新通知角标，不自动展开抽屉
+    window.addEventListener('DOMContentLoaded', () => {
+        syncNotificationDrawer();
+        setInterval(syncNotificationDrawer, 2000);
+    });
+    </script>
+</body>
+</html>

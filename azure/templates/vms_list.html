@@ -1,0 +1,558 @@
+{% extends 'base.html' %}
+{% block title %}虚拟机列表{% endblock %}
+
+{% block content %}
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; flex-wrap: wrap; gap: 0.75rem;">
+    <div>
+        <h2 style="font-size: 1.35rem; font-weight: 700; margin-bottom: 0;">虚拟机管理</h2>
+        <span style="color: var(--text-muted); font-size: 0.85rem;">
+                当前范围: <strong>{{ current_sub.display_name if current_sub else '全部 ' ~ (all_subs|length) ~ ' 个有效订阅' }}</strong>
+            {% if current_sub %}(<code>{{ current_sub.subscription_id }}</code>){% endif %}
+        </span>
+    </div>
+    <div style="display: flex; gap: 0.5rem; align-items: center;">
+        <select class="form-control toolbar-select" onchange="location.href='/vms' + (this.value ? '?sub_id=' + this.value : '');">
+            <option value="">-- 全部订阅虚拟机 --</option>
+            {% for acc in all_accounts %}
+                <optgroup label="账户: {{ acc.name }}">
+                    {% for s in acc.subscriptions %}
+                    <option value="{{ s.id }}" {% if current_sub and current_sub.id == s.id %}selected{% endif %}>
+                        {{ s.display_name }} ({{ s.subscription_id[:8] }}...)
+                    </option>
+                    {% endfor %}
+                </optgroup>
+            {% endfor %}
+        </select>
+        <button type="button" class="btn btn-outline btn-sm" id="btn-refresh-vms" onclick="loadVMsData(true)">刷新列表</button>
+        {% if all_subs %}
+        <a href="{{ url_for('create_vm_page', sub_id=current_sub.id if current_sub else all_subs[0].id) }}" class="btn btn-primary">+ 创建虚拟机</a>
+        {% endif %}
+    </div>
+</div>
+
+{% if error_msg %}
+<div class="alert alert-danger">
+                拉取虚拟机列表失败: {{ error_msg }}
+</div>
+{% endif %}
+
+<div class="card vm-list-card" style="padding: 0; overflow: hidden; min-height: 380px;">
+    <div class="table-responsive vm-list-table" id="vm-table-box" style="display: block;">
+        <table class="table" style="margin-bottom: 0;">
+            <thead>
+                <tr>
+                    <th>所属订阅</th>
+                    <th>实例名称 / 资源组</th>
+                    <th class="table-compact">规格 / 操作系统</th>
+                    <th>地域</th>
+                    <th>公网 IP</th>
+                    <th class="table-status">状态</th>
+                    <th class="table-actions">快捷操作</th>
+                </tr>
+            </thead>
+            <tbody id="vm-tbody">
+                <tr id="vm-tbody-placeholder">
+                    <td colspan="7" class="table-state" style="border-bottom: none !important;">
+                        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.75rem;">
+                            <svg class="spin nav-icon" viewBox="0 0 24 24" style="width: 26px; height: 26px; color: var(--primary);"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg>
+                            <span style="font-size: 0.875rem; font-weight: 500;">正在同步虚拟机列表与状态...</span>
+                        </div>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div id="vm-empty-box" style="display: none; text-align: center; padding: 4rem 1rem; color: var(--text-muted);">
+        <p style="font-size: 0.95rem; margin-bottom: 0.5rem;">当前订阅下暂无虚拟机实例</p>
+        {% if all_subs %}
+        <a href="{{ url_for('create_vm_page', sub_id=current_sub.id if current_sub else all_subs[0].id) }}" class="btn btn-primary" style="margin-top: 0.5rem;">立即创建第一台</a>
+        {% endif %}
+    </div>
+</div>
+
+<!-- 列表操作统一模态确认弹窗 -->
+<div id="list-action-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 520px;">
+        <div class="modal-header">
+            <div class="modal-title" id="list-action-title">操作确认</div>
+            <button type="button" class="modal-close" onclick="closeModal('list-action-modal')">&times;</button>
+        </div>
+        <div id="list-action-body" style="color: var(--text-main); font-size: 0.9rem; margin-bottom: 1rem;"></div>
+        <form id="list-action-form" method="post" action="">
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('list-action-modal')">取消</button>
+                <button type="submit" class="btn" id="list-action-submit">确认执行</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+function setVmRefreshButtonBusy(busy) {
+    const btn = document.getElementById("btn-refresh-vms");
+    setButtonBusy(btn, busy, "同步中...", "刷新列表");
+}
+
+// 完成回调会立即触发一次最新列表请求；旧请求若晚返回，不能覆盖这次结果。
+let vmDataRequestSequence = 0;
+
+function loadVMsData(forceRefresh = false) {
+    const btn = document.getElementById('btn-refresh-vms');
+    const tableBox = document.getElementById('vm-table-box');
+    const emptyBox = document.getElementById('vm-empty-box');
+    const tbody = document.getElementById('vm-tbody');
+
+    if (forceRefresh && btn && btn.disabled) return;
+    const requestId = ++vmDataRequestSequence;
+    if (forceRefresh) {
+        setVmRefreshButtonBusy(true);
+        showTopAlert("已开始同步虚拟机列表，进度可在活动通知查看。", "info");
+    }
+
+    const subParam = '{{ current_sub.id if current_sub else "" }}';
+    let url = `/api/sub/vms_data?${forceRefresh ? 'refresh=1&' : ''}`;
+    if (subParam) url += `sub_id=${subParam}`;
+
+    // VM 数据与进行中任务由同一个接口返回，避免两个请求产生状态竞态。
+    fetch(url, { cache: 'no-store' })
+    .then(r => r.json())
+    .then(res => {
+        if (requestId !== vmDataRequestSequence) return;
+        const tasks = Array.isArray(res.active_tasks) ? res.active_tasks : [];
+        if (forceRefresh && res.task_id) {
+            // 任务监听统一由 restoreRunningTasks(tasks) 建立，避免重复 watcher。
+            setVmRefreshButtonBusy(true);
+        } else if (forceRefresh) {
+            setVmRefreshButtonBusy(false);
+        }
+
+        if (res.refresh_failed && !res.task_id) {
+            showTopAlert(res.message || "Azure 同步失败，当前显示旧缓存", "warning");
+        } else if (forceRefresh && !res.task_id) {
+            if (res.status === "success") {
+                showTopAlert("虚拟机列表与状态已同步至最新！", "success");
+            } else {
+                showTopAlert(`虚拟机列表同步失败：${res.message || "网络连接超时"}`, "danger");
+            }
+        }
+
+        if (res.status === 'success') {
+            const vms = res.vms || [];
+            // 筛选当前正在进行的活跃任务，并将详情页操作映射回列表行
+            const activeTasks = tasks.filter(t => t.status === 'InProgress' || t.status === 'Pending');
+            const detailTaskLabels = {
+                reinstall: '重装中',
+                resize: '调整规格中',
+                change_ip: '更换 IP 中',
+                reset_credentials: '重置凭据中'
+            };
+            const vmStateKey = (subscriptionId, resourceGroup, vmName) => JSON.stringify([
+                String(subscriptionId ?? ''),
+                String(resourceGroup ?? '').toLowerCase(),
+                String(vmName ?? '').toLowerCase()
+            ]);
+            const taskStateKey = task => vmStateKey(task.subscription_id, task.resource_group, task.target_name);
+            const vmRecordStateKey = vm => vmStateKey(vm.sub_id, vm.resource_group, vm.name);
+            const detailTaskTypes = new Set(Object.keys(detailTaskLabels));
+            const detailTaskMap = new Map(activeTasks
+                .filter(t => detailTaskTypes.has(t.task_type) && t.target_name)
+                .map(t => [taskStateKey(t), t]));
+            const creatingTasks = activeTasks.filter(t => t.task_type === 'create');
+            const creatingTaskMap = new Map(creatingTasks.map(t => [taskStateKey(t), t]));
+            const deletingTaskMap = new Map(activeTasks.filter(t => t.task_type === 'delete').map(t => [taskStateKey(t), t]));
+            const deletingTasks = activeTasks.filter(t => t.task_type === 'delete');
+            const stoppingTaskMap = new Map(activeTasks.filter(t => t.task_type === 'stop').map(t => [taskStateKey(t), t]));
+            const startingTaskMap = new Map(activeTasks.filter(t => t.task_type === 'start').map(t => [taskStateKey(t), t]));
+            const restartingTaskMap = new Map(activeTasks.filter(t => t.task_type === 'restart').map(t => [taskStateKey(t), t]));
+
+            const existingVmNames = new Set(vms.map(vmRecordStateKey));
+
+            if (vms.length === 0 && creatingTasks.length === 0 && deletingTasks.length === 0) {
+                emptyBox.style.display = 'block';
+                tableBox.style.display = 'none';
+            } else {
+                emptyBox.style.display = 'none';
+                tableBox.style.display = 'block';
+                if (!tbody.dataset.rendered) {
+                    tbody.className = 'fade-in';
+                    tbody.dataset.rendered = '1';
+                }
+                tbody.innerHTML = '';
+
+                // 1. 优先渲染正在创建中的虚拟机占位行 (解决创建后列表不显示的问题)
+                creatingTasks.forEach(ct => {
+                        const tr = document.createElement('tr');
+                        tr.dataset.createTaskId = String(ct.id);
+                        tr.style.backgroundColor = '#f0f9ff';
+                        tr.innerHTML = `
+                            <td><div><strong>{{ current_sub.display_name if current_sub else '当前订阅' }}</strong></div></td>
+                            <td>
+                                <strong>${escapeHtml(ct.target_name)}</strong>
+                                <div style="font-size: 0.75rem; color: var(--text-muted);">${escapeHtml(ct.resource_group)}</div>
+                            </td>
+                            <td class="table-compact"><div><strong>部署中</strong></div></td>
+                            <td>-</td>
+                            <td><code style="color: var(--text-muted);">分配中...</code></td>
+                            <td class="table-status">
+                                <span class="badge badge-warning" style="display: inline-flex; align-items: center; gap: 0.3rem;">
+                                    <svg class="spin status-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg>
+                创建中
+                                </span>
+                            </td>
+                            <td class="table-actions table-description">
+                                <span class="vm-create-progress" style="font-size: 0.8rem; color: var(--primary); font-weight: 500;">${escapeHtml(ct.progress_msg)}</span>
+                            </td>
+                        `;
+                        tbody.appendChild(tr);
+                });
+
+
+                // 2. 缓存暂时没有删除中的 VM 时，保留一行占位，直到销毁任务进入终态。
+                deletingTasks.forEach(dt => {
+                    const vmName = dt.target_name || '';
+                    if (!existingVmNames.has(taskStateKey(dt))) {
+                        const tr = document.createElement('tr');
+                        tr.style.backgroundColor = '#fff7ed';
+                        tr.innerHTML = `
+                            <td><div><strong>{{ current_sub.display_name if current_sub else '当前订阅' }}</strong></div></td>
+                            <td>
+                                <strong>${escapeHtml(vmName)}</strong>
+                                <div style="font-size: 0.75rem; color: var(--text-muted);">${escapeHtml(dt.resource_group || '-')}</div>
+                            </td>
+                            <td class="table-compact"><div><strong>虚拟机</strong></div><div style="font-size: 0.75rem; color: var(--text-muted);">资源清理中</div></td>
+                            <td>-</td>
+                            <td><code style="color: var(--text-muted);">释放中...</code></td>
+                            <td class="table-status">
+                                <span class="badge badge-danger" style="display: inline-flex; align-items: center; gap: 0.3rem;">
+                                    <svg class="spin status-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg>
+                                    销毁中
+                                </span>
+                            </td>
+                            <td class="table-actions table-description">
+                                <span style="font-size: 0.8rem; color: var(--danger); font-weight: 500;">${escapeHtml(dt.progress_msg || '正在销毁虚拟机...')}</span>
+                            </td>
+                        `;
+                        tbody.appendChild(tr);
+                    }
+                });
+
+                // 3. 渲染已就绪的真实虚拟机行 (自动融合删除中、关机中、重启中等进行中状态与按钮锁定动效)
+                vms.forEach(vm => {
+
+                    const tr = document.createElement('tr');
+                    const vmKey = vmRecordStateKey(vm);
+                    if (creatingTaskMap.has(vmKey)) return;
+                    const isDeleting = deletingTaskMap.has(vmKey);
+                    const isStopping = stoppingTaskMap.has(vmKey);
+                    const isStarting = startingTaskMap.has(vmKey);
+                    const isRestarting = restartingTaskMap.has(vmKey);
+                    const detailTask = detailTaskMap.get(vmKey);
+                    const detailTaskLabel = detailTask ? detailTaskLabels[detailTask.task_type] : '';
+                    const pLower = (vm.power_state || '').toLowerCase();
+                    const provisioningLower = (vm.provisioning_state || '').toLowerCase();
+                    const isProvisioning = pLower.includes('starting') || pLower.includes('creating') || pLower.includes('provisioning') || provisioningLower.includes('creating') || provisioningLower.includes('updating');
+                    const isBusy = isProvisioning || isDeleting || isStopping || isStarting || isRestarting || Boolean(detailTaskLabel);
+
+                    let badgeClass = 'badge-warning';
+                    let powerStatusText = vm.power_state;
+
+                    if (detailTaskLabel) {
+                        badgeClass = 'badge-warning';
+                        powerStatusText = buttonBusyMarkup(detailTaskLabel);
+                    } else if (isDeleting) {
+                        badgeClass = 'badge-danger';
+                        powerStatusText = `<svg class="spin status-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg> 销毁中`;
+                    } else if (isStopping) {
+                        badgeClass = 'badge-warning';
+                        powerStatusText = `<svg class="spin status-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg> 关机中`;
+                    } else if (isStarting) {
+                        badgeClass = 'badge-warning';
+                        powerStatusText = `<svg class="spin status-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg> 开机中`;
+                    } else if (isRestarting) {
+                        badgeClass = 'badge-warning';
+                        powerStatusText = `<svg class="spin status-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg> 重启中`;
+                    } else if (isProvisioning) {
+                        badgeClass = 'badge-warning';
+                        powerStatusText = buttonBusyMarkup('启动中');
+                    } else if (pLower.includes('running')) {
+                        badgeClass = 'badge-success';
+                        powerStatusText = '运行中';
+                    } else if (pLower.includes('deallocated') || pLower.includes('stopped')) {
+                        badgeClass = 'badge-secondary';
+                        powerStatusText = '已停止';
+                    }
+
+                    // 构建操作按钮 HTML (无论是否处于执行中，始终完整输出整套按钮，绝不缺席被吞！)
+                    let buttonsHtml = '';
+                    const isRunningMode = pLower.includes('running') || pLower.includes('starting') || isStopping || isRestarting || isProvisioning;
+
+                    if (isRunningMode) {
+                        // 运行中态的完整三件套：重启、关机、销毁
+                        const restartLabel = isRestarting ? buttonBusyMarkup('重启中') : '重启';
+                        const stopLabel = isStopping ? buttonBusyMarkup('关机中') : '关机';
+                        const deleteLabel = isDeleting ? buttonBusyMarkup('销毁中') : '销毁';
+
+                        buttonsHtml = `
+                            <button type="button" class="btn btn-outline btn-xs ${isBusy ? 'disabled-locked' : ''}" id="btn-act-${escapeHtml(vm.name)}-restart" ${isBusy ? 'disabled' : ''} data-vm-action="restart" data-vm-sub-id="${escapeHtml(vm.sub_id)}" data-vm-resource-group="${escapeHtml(vm.resource_group)}" data-vm-name="${escapeHtml(vm.name)}">${restartLabel}</button>
+                            <button type="button" class="btn btn-warning btn-xs ${isBusy ? 'disabled-locked' : ''}" id="btn-act-${escapeHtml(vm.name)}-stop" ${isBusy ? 'disabled' : ''} data-vm-action="stop" data-vm-sub-id="${escapeHtml(vm.sub_id)}" data-vm-resource-group="${escapeHtml(vm.resource_group)}" data-vm-name="${escapeHtml(vm.name)}">${stopLabel}</button>
+                            <button type="button" class="btn btn-danger btn-xs ${isBusy ? 'disabled-locked' : ''}" id="btn-act-${escapeHtml(vm.name)}-delete" ${isBusy ? 'disabled' : ''} data-vm-action="delete" data-vm-sub-id="${escapeHtml(vm.sub_id)}" data-vm-resource-group="${escapeHtml(vm.resource_group)}" data-vm-name="${escapeHtml(vm.name)}">${deleteLabel}</button>
+                        `;
+                    } else {
+                        // 已停止态的完整两件套：开机、销毁
+                        const startLabel = isStarting ? buttonBusyMarkup('开机中') : '开机';
+                        const deleteLabel = isDeleting ? buttonBusyMarkup('销毁中') : '销毁';
+
+                        buttonsHtml = `
+                            <button type="button" class="btn btn-primary btn-xs ${isBusy ? 'disabled-locked' : ''}" id="btn-act-${escapeHtml(vm.name)}-start" ${isBusy ? 'disabled' : ''} data-vm-action="start" data-vm-sub-id="${escapeHtml(vm.sub_id)}" data-vm-resource-group="${escapeHtml(vm.resource_group)}" data-vm-name="${escapeHtml(vm.name)}">${startLabel}</button>
+                            <button type="button" class="btn btn-danger btn-xs ${isBusy ? 'disabled-locked' : ''}" id="btn-act-${escapeHtml(vm.name)}-delete" ${isBusy ? 'disabled' : ''} data-vm-action="delete" data-vm-sub-id="${escapeHtml(vm.sub_id)}" data-vm-resource-group="${escapeHtml(vm.resource_group)}" data-vm-name="${escapeHtml(vm.name)}">${deleteLabel}</button>
+                        `;
+                    }
+
+                    tr.innerHTML = `
+                        <td>
+                            <div><strong>${escapeHtml(vm.sub_name || '-')}</strong></div>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">${escapeHtml(vm.account_name || "")}</div>
+                        </td>
+                        <td>
+                            <a href="/sub/${vm.sub_id}/vm/${escapeHtml(vm.resource_group)}/${escapeHtml(vm.name)}" class="btn-detail-link" style="font-weight: 600; color: var(--primary); text-decoration: none;">
+                                ${escapeHtml(vm.name)}
+                            </a>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">RG: ${escapeHtml(vm.resource_group)}</div>
+                        </td>
+                        <td class="table-compact">
+                            <div><strong>${escapeHtml(vm.vm_size)}</strong></div>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">${escapeHtml(vm.os_type)}</div>
+                        </td>
+                        <td>${escapeHtml(vm.location)}</td>
+                        <td class="table-compact">
+                            <code style="font-weight: 600; color: #0284c7; font-size: 0.85rem;">${escapeHtml(vm.public_ip)}</code>
+                        </td>
+                        <td class="table-status">
+                            <span class="badge ${badgeClass}" id="vm-status-badge-${escapeHtml(vm.name)}">${powerStatusText}</span>
+                        </td>
+                        <td class="table-actions">
+                            <div class="btn-group-nowrap" id="action-group-${escapeHtml(vm.name)}">
+                                <a href="/sub/${vm.sub_id}/vm/${escapeHtml(vm.resource_group)}/${escapeHtml(vm.name)}" class="btn btn-outline btn-xs">详情</a>
+                                ${buttonsHtml}
+                            </div>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            }
+            restoreRunningTasks(tasks);
+        }
+    })
+    .catch(err => {
+        if (requestId !== vmDataRequestSequence) return;
+        setVmRefreshButtonBusy(false);
+        console.error("Failed to load VMs:", err);
+    });
+}
+
+let currentActionButton = null;
+
+function openActionModal(action, subId, rg, vmName, actionButton = null) {
+    currentActionButton = actionButton;
+    const modal = document.getElementById('list-action-modal');
+    const titleEl = document.getElementById('list-action-title');
+    const bodyEl = document.getElementById('list-action-body');
+    const formEl = document.getElementById('list-action-form');
+    const submitBtn = document.getElementById('list-action-submit');
+
+    formEl.action = `/sub/${subId}/vm/${rg}/${vmName}/action/${action}`;
+    submitBtn.className = 'btn';
+
+    if (action === 'start') {
+        titleEl.textContent = '开机启动确认';
+        bodyEl.innerHTML = `确定要启动虚拟机 <strong>${escapeHtml(vmName)}</strong> 吗？`;
+        submitBtn.classList.add('btn-primary');
+        submitBtn.textContent = '确认开机';
+    } else if (action === 'stop') {
+        titleEl.textContent = '停止并解除分配 (关机释放计费)';
+        bodyEl.innerHTML = `确定要停止并解除分配虚拟机 <strong>${escapeHtml(vmName)}</strong> 吗？<p style="margin-top: 0.5rem; color: var(--text-muted); font-size: 0.85rem;">停止后虚拟机进入 <code>Deallocated</code> 状态并立即停止计算资源计费。</p>`;
+        submitBtn.classList.add('btn-warning');
+        submitBtn.textContent = '确认关机';
+    } else if (action === 'restart') {
+        titleEl.textContent = '重启虚拟机确认';
+        bodyEl.innerHTML = `确定要重启虚拟机 <strong>${escapeHtml(vmName)}</strong> 吗？<p style="margin-top: 0.5rem; color: var(--text-muted); font-size: 0.85rem;">重启期间网络连接将短暂中断。</p>`;
+        submitBtn.classList.add('btn-primary');
+        submitBtn.textContent = '确认重启';
+    } else if (action === 'delete') {
+        titleEl.textContent = '销毁虚拟机确认';
+        bodyEl.innerHTML = `
+            <div style="font-size: 0.92rem; line-height: 1.6; color: var(--text-main);">
+                确定要销毁虚拟机 <strong>${escapeHtml(vmName)}</strong> 吗？
+                <p style="margin-top: 0.6rem; margin-bottom: 0; color: var(--danger); font-size: 0.82rem; font-weight: 500;">
+                此操作不可逆，将彻底销毁该虚拟机及其所属资源组下的系统盘、网卡与公网 IP 等全部关联资源。
+                </p>
+            </div>
+        `;
+        submitBtn.classList.add('btn-danger');
+        submitBtn.textContent = '确认销毁';
+    }
+
+    formEl.onsubmit = function(e) {
+        e.preventDefault();
+        setButtonBusy(submitBtn, true, "提交中...", null);
+        showTopAlert("已开始执行虚拟机操作，进度可在活动通知查看。", "info");
+
+        // 仅锁定当前行的操作按钮，放行详情链接
+        const actGroup = currentActionButton ? currentActionButton.closest('.btn-group-nowrap') : null;
+        const actBtn = currentActionButton;
+        if (actGroup) {
+            actGroup.querySelectorAll('button').forEach(b => {
+                b.disabled = true;
+                b.classList.add('disabled-locked');
+            });
+        }
+        const actionLabels = { start: '开机', stop: '关机', restart: '重启', delete: '销毁' };
+        const originalSubmitLabel = submitBtn.textContent;
+        const originalActLabel = actBtn ? actBtn.textContent : (actionLabels[action] || '操作');
+        if (actBtn) {
+            actBtn.classList.remove('disabled-locked');
+            let aLabel = '处理中';
+            if (action === 'restart') aLabel = '重启中';
+            else if (action === 'stop') aLabel = '关机中';
+            else if (action === 'start') aLabel = '开机中';
+            else if (action === 'delete') aLabel = '销毁中';
+            actBtn.innerHTML = buttonBusyMarkup(aLabel);
+        }
+
+        const formData = new FormData(formEl);
+        fetch(formEl.action, {
+            method: 'POST',
+            body: formData,
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRF-Token': '{{ csrf_token }}' }
+        })
+        .then(res => res.json().then(data => ({ ok: res.ok, data })))
+        .then(({ ok, data }) => {
+            const isAcceptedTask = data.status === 'submitted' || data.status === 'in_progress';
+            if (!ok || !isAcceptedTask || !data.task_id) {
+                throw new Error(data.message || '虚拟机操作提交失败');
+            }
+            if (data.status === 'in_progress') {
+                showTopAlert(data.message || '该虚拟机已有操作正在执行，已继续跟踪当前任务。', 'info');
+            }
+            setTimeout(() => {
+                closeModal('list-action-modal');
+                submitBtn.disabled = false;
+                const statusBadge = document.getElementById(`vm-status-badge-${vmName}`);
+                if (statusBadge) {
+                    if (action === 'stop') {
+                        statusBadge.className = 'badge badge-warning';
+                        statusBadge.innerHTML = `<svg class="spin status-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg> 关机中`;
+                    } else if (action === 'delete') {
+                        statusBadge.className = 'badge badge-danger';
+                        statusBadge.innerHTML = `<svg class="spin status-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg> 销毁中`;
+                    } else if (action === 'restart') {
+                        statusBadge.className = 'badge badge-warning';
+                        statusBadge.innerHTML = `<svg class="spin status-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg> 重启中`;
+                    } else if (action === 'start') {
+                        statusBadge.className = 'badge badge-warning';
+                        statusBadge.innerHTML = `<svg class="spin status-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg> 开机中`;
+                    }
+                }
+
+                startWatchingTask(vmName, data.task_type || action, data.task_id, function(success, task) {
+                    if (!success) {
+                            showTopAlert(`虚拟机操作失败：${(task && (task.error_detail || task.progress_msg)) || "请查看活动通知"}`, "danger");
+                        } else {
+                            showTopAlert(`虚拟机操作已完成：${(task && task.progress_msg) || "操作已完成"}`, "success");
+                        }
+                        loadVMsData(false);
+
+                });
+            }, 120);
+        })
+        .catch(err => {
+            console.error("Action error:", err);
+            closeModal('list-action-modal');
+            setButtonBusy(submitBtn, false, '', originalSubmitLabel);
+            if (actGroup) {
+                actGroup.querySelectorAll('button').forEach(b => {
+                    b.disabled = false;
+                    b.classList.remove('disabled-locked');
+                });
+            }
+            if (actBtn) setButtonBusy(actBtn, false, '', originalActLabel);
+            showTopAlert('虚拟机操作请求失败：' + (err.message || '网络连接异常，请稍后重试'), 'danger');
+        });
+    };
+
+    openModal('list-action-modal');
+}
+
+function restoreRunningTasks(tasks) {
+    const currentSubId = Number('{{ current_sub.id if current_sub else 0 }}');
+    const scopedTasks = (tasks || []).filter(t => !currentSubId || !t.subscription_id || t.subscription_id === currentSubId);
+
+    scopedTasks.forEach(t => {
+        if (t.status !== 'InProgress' && t.status !== 'Pending') return;
+
+        if (t.task_type === 'sync_vms') {
+            setVmRefreshButtonBusy(true);
+            startWatchingTask(t.target_name || '虚拟机列表', t.task_type, t.id, function(success, task) {
+                if (success) {
+                    showTopAlert('虚拟机列表与状态已同步至最新！', 'success');
+                } else {
+                    showTopAlert('虚拟机列表同步失败：' + ((task && (task.error_detail || task.progress_msg)) || '网络连接超时'), 'danger');
+                }
+                setVmRefreshButtonBusy(false);
+                loadVMsData(false);
+            }, false);
+            return;
+        }
+
+        const vmName = t.target_name || '';
+        startWatchingTask(vmName, t.task_type, t.id, function(success, task) {
+            if (!success) {
+                showTopAlert('虚拟机操作失败：' + ((task && (task.error_detail || task.progress_msg)) || '请查看活动通知'), 'danger');
+            } else {
+                showTopAlert('虚拟机操作已完成：' + ((task && task.progress_msg) || '操作已完成'), 'success');
+            }
+            loadVMsData(false);
+        }, false);
+    });
+}
+
+// 创建任务轮询时只更新对应的占位行，避免整张列表重新加载造成闪烁或状态回退。
+window.addEventListener('azure-task-progress', function(event) {
+    const task = event.detail || {};
+    if (task.task_type !== 'create') return;
+    const taskId = String(task.id ?? '');
+    if (!taskId) return;
+    const row = Array.from(document.querySelectorAll('tr[data-create-task-id]'))
+        .find(item => item.dataset.createTaskId === taskId);
+    const progress = row && row.querySelector('.vm-create-progress');
+    if (progress) progress.textContent = task.progress_msg || '正在创建虚拟机...';
+});
+
+function checkAndRestoreRunningTasks() {
+    fetch('/api/tasks/list', { cache: 'no-store' })
+        .then(res => res.json())
+        .then(data => restoreRunningTasks(data.tasks || []))
+        .catch(err => console.error('Restore tasks error:', err));
+}
+
+const vmTbody = document.getElementById('vm-tbody');
+if (vmTbody) {
+    vmTbody.addEventListener('click', function(event) {
+        const button = event.target.closest('[data-vm-action]');
+        if (!button || button.disabled) return;
+        openActionModal(
+            button.dataset.vmAction,
+            button.dataset.vmSubId,
+            button.dataset.vmResourceGroup,
+            button.dataset.vmName,
+            button
+        );
+    });
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+    loadVMsData(false);
+});
+</script>
+{% endblock %}

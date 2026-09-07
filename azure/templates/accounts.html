@@ -1,0 +1,260 @@
+{% extends 'base.html' %}
+{% block title %}云账户管理{% endblock %}
+
+{% block content %}
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; flex-wrap: wrap; gap: 0.75rem;">
+    <div>
+        <h2 style="font-size: 1.35rem; font-weight: 700; margin-bottom: 0;">Azure 云账户与凭据</h2>
+        <span style="color: var(--text-muted); font-size: 0.85rem;">管理 Azure Service Principal (应用注册) 凭据，自动发现订阅</span>
+    </div>
+    <button class="btn btn-primary" onclick="openModal('add-account-modal')">+ 添加 Azure 账户</button>
+</div>
+
+<div class="card">
+    <div class="card-title">已绑定的 Azure 服务主体 (已自动加密存储密钥)</div>
+
+    {% if not accounts %}
+    <div style="text-align: center; padding: 3rem; color: var(--text-muted);">
+        <p>暂无绑定的 Azure 账户，请点击右上角添加您的首个 Service Principal 凭据</p>
+        <button class="btn btn-primary" style="margin-top: 1rem;" onclick="openModal('add-account-modal')">+ 立即添加账户</button>
+    </div>
+    {% else %}
+    <div class="table-responsive">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>账户备注名称</th>
+                    <th class="table-id">Tenant ID (租户 ID)</th>
+                    <th class="table-id">Client ID (App ID)</th>
+                    <th class="table-description">已同步有效订阅</th>
+                    <th>添加时间</th>
+                    <th class="table-actions">操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for acc in accounts %}
+                <tr>
+                    <td><strong>{{ acc.name }}</strong></td>
+                    <td class="table-id"><code>{{ acc.tenant_id[:8] }}...{{ acc.tenant_id[-4:] }}</code></td>
+                    <td class="table-id"><code>{{ acc.client_id[:8] }}...{{ acc.client_id[-4:] }}</code></td>
+                    <td class="table-description">
+                        <ul style="list-style: none; padding: 0; margin: 0;">
+                            {% for sub in acc.subscriptions %}
+                            <li style="margin-bottom: 0.25rem;">
+                                <a href="{{ url_for('vms_page', sub_id=sub.id) }}" style="color: var(--primary); text-decoration: none; font-weight: 500;">
+                                    {{ sub.display_name }} ({{ sub.subscription_id[:8] }}...)
+                                </a>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </td>
+                    <td style="color: var(--text-muted);">{{ acc.created_at|format_dt }}</td>
+                    <td class="table-actions">
+                        <div class="btn-group-nowrap">
+                            <button type="button" class="btn btn-outline btn-sm" id="btn-sync-acc-{{ acc.id }}" data-account-sync data-account-id="{{ acc.id }}" data-account-name="{{ acc.name|e }}">同步订阅</button>
+                            <button type="button" class="btn btn-danger btn-sm" data-account-delete data-account-id="{{ acc.id }}" data-account-name="{{ acc.name|e }}">删除</button>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+</div>
+
+<!-- 1. 添加 Azure 账户 Modal 弹窗 -->
+<div id="add-account-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 640px;">
+        <div class="modal-header">
+            <div class="modal-title">添加 Azure 账户凭据</div>
+            <button type="button" class="modal-close" onclick="closeModal('add-account-modal')">&times;</button>
+        </div>
+        <form method="post" id="form-add-account">
+            <input type="hidden" name="action" value="add_account">
+            <div class="form-group">
+                <label class="form-label">账户备注名称</label>
+                <input type="text" name="name" class="form-control" placeholder="例如: 个人订阅1 / 生产企业号" required>
+            </div>
+
+            <div style="background: #f8fafc; border: 1px dashed var(--border-color); border-radius: 8px; padding: 1rem; margin-bottom: 1rem;">
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label class="form-label">方式 A: 一键粘贴 Azure CLI 快捷字符串或 JSON (推荐)</label>
+                    <input type="text" name="api_string" class="form-control" placeholder="appId|password|tenant 或完整 JSON 输出">
+                    <small style="color: var(--text-muted); display: block; margin-top: 0.35rem; font-size: 0.75rem;">
+                在 Azure Cloud Shell 执行 <code>az ad sp create-for-rbac --role contributor</code> 获取输出
+                    </small>
+                </div>
+            </div>
+
+            <div style="text-align: center; color: var(--text-muted); font-size: 0.8rem; margin: 0.75rem 0;">— 或者分别输入 —</div>
+
+            <div class="grid-3">
+                <div class="form-group">
+                    <label class="form-label">Tenant ID (租户 ID)</label>
+                    <input type="text" name="tenant_id" class="form-control" placeholder="租户 ID">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Client ID (App ID)</label>
+                    <input type="text" name="client_id" class="form-control" placeholder="客户端 ID">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Client Secret (密钥)</label>
+                    <input type="password" name="client_secret" class="form-control" placeholder="••••••••">
+                </div>
+            </div>
+
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('add-account-modal')">取消</button>
+                <button type="submit" id="btn-submit-account" class="btn btn-primary">验证并自动同步订阅</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- 2. 删除账户确认模态弹窗 -->
+<div id="delete-account-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 480px;">
+        <div class="modal-header">
+            <div class="modal-title" style="color: var(--danger);">删除 Azure 云账户</div>
+            <button type="button" class="modal-close" onclick="closeModal('delete-account-modal')">&times;</button>
+        </div>
+        <div style="font-size: 0.9rem; color: var(--text-main); margin-bottom: 1rem;">
+            <div class="alert alert-danger" style="margin-bottom: 0.75rem;">
+                <strong>警告：</strong> 解绑账户将同步清除该账户下所有已识别订阅的关联配置！
+            </div>
+                确定要删除账户 <strong id="delete-account-target-name"></strong> 吗？
+        </div>
+        <form id="delete-account-form" method="post" action="">
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('delete-account-modal')">取消</button>
+                <button type="submit" id="btn-confirm-del-acc" class="btn btn-danger">确认删除账户</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+function triggerAccountSync(accId, accName) {
+    const btn = document.getElementById(`btn-sync-acc-${accId}`);
+    if (btn) {
+        setButtonBusy(btn, true, "探测中...", "同步订阅");
+    }
+    showTopAlert("已开始同步账户订阅，进度可在活动通知查看。", "info");
+
+    fetch(`/account/${accId}/sync_action`, {
+        method: 'POST',
+        headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRF-Token': '{{ csrf_token }}' }
+    })
+    .then(res => res.json().then(data => ({ ok: res.ok, data })))
+    .then(({ ok, data }) => {
+        if (ok && data.status === "submitted" && data.task_id) {
+            startWatchingTask(data.acc_name || accName, data.task_type || "sync_subscriptions", data.task_id, function(success, task) {
+                if (btn) {
+                    setButtonBusy(btn, false, "", "同步订阅");
+                }
+                if (success) {
+                    sessionStorage.setItem("pending_top_alert", JSON.stringify({ msg: "账户【" + (data.acc_name || accName) + "】订阅同步完成。", type: "success" }));
+                    location.reload();
+                } else {
+                    showTopAlert("账户【" + (data.acc_name || accName) + "】订阅同步失败：" + ((task && (task.error_detail || task.progress_msg)) || "请稍后重试"), "danger");
+                }
+            }, false);
+        } else {
+            if (btn) {
+                setButtonBusy(btn, false, "", "同步订阅");
+            }
+            showTopAlert(`账户【${accName}】订阅同步失败：${data.message || '凭据无效或网络超时'}`, 'danger');
+        }
+    })
+    .catch(err => {
+        console.error("Sync error:", err);
+        if (btn) {
+            setButtonBusy(btn, false, "", "同步订阅");
+        }
+        showTopAlert(`账户【${accName}】订阅同步失败：${err.message || '网络连接超时'}`, 'danger');
+    });
+}
+
+// 页面加载后自动展示待呈现的顶部通知
+window.addEventListener('DOMContentLoaded', () => {
+    const pending = sessionStorage.getItem('pending_top_alert');
+    if (pending) {
+        sessionStorage.removeItem('pending_top_alert');
+        try {
+            const item = JSON.parse(pending);
+            showTopAlert(item.msg, item.type);
+        } catch (e) {}
+    }
+});
+
+function openDeleteAccountModal(accId, accName) {
+    document.getElementById('delete-account-target-name').textContent = accName;
+    document.getElementById('delete-account-form').action = `/account/${accId}/delete_action`;
+    openModal('delete-account-modal');
+}
+
+document.getElementById('form-add-account').addEventListener('submit', function(e) {
+    e.preventDefault();
+    submitFormAfterPaint(this, "正在连接 Azure 验证凭据...");
+});
+
+document.getElementById('delete-account-form').addEventListener('submit', function(e) {
+    e.preventDefault();
+    submitFormAfterPaint(this, "删除中...");
+});
+function restoreAccountSyncButtons(accName = '') {
+    document.querySelectorAll('[id^="btn-sync-acc-"]').forEach(btn => {
+        const card = btn.closest('.card');
+        if (!accName || (card && card.textContent.includes(accName))) {
+            setButtonBusy(btn, false, '', '同步订阅');
+        }
+    });
+}
+
+function checkAndRestoreAccountTasks() {
+    fetch('/api/tasks/list', { cache: 'no-store' })
+        .then(res => res.json())
+        .then(data => {
+            const tasks = data.tasks || [];
+            const activeSyncs = tasks.filter(t => t.task_type === 'sync_subscriptions' && (t.status === 'InProgress' || t.status === 'Pending'));
+            activeSyncs.forEach(t => {
+                const accName = t.target_name || '';
+                document.querySelectorAll('[id^="btn-sync-acc-"]').forEach(btn => {
+                    const parentCard = btn.closest('.card');
+                    if (parentCard && parentCard.textContent.includes(accName)) {
+                        setButtonBusy(btn, true, "探测中...", "同步订阅");
+                    }
+                });
+                startWatchingTask(accName, "sync_subscriptions", t.id, function(success, task) {
+                    if (success) {
+                        sessionStorage.setItem("pending_top_alert", JSON.stringify({ msg: "账户订阅同步已完成。", type: "success" }));
+                        location.reload();
+                    } else {
+                        restoreAccountSyncButtons(accName);
+                        showTopAlert("账户订阅同步失败：" + ((task && (task.error_detail || task.progress_msg)) || "请稍后重试"), "danger");
+                    }
+                }, false);
+            });
+        })
+        .catch(err => {
+            console.error("Restore account tasks error:", err);
+            restoreAccountSyncButtons();
+            showTopAlert("账户同步状态恢复失败，请刷新页面重试。", "warning");
+        });
+}
+
+window.addEventListener('DOMContentLoaded', checkAndRestoreAccountTasks);
+document.addEventListener('click', function(event) {
+    const syncButton = event.target.closest('[data-account-sync]');
+    if (syncButton) {
+        triggerAccountSync(syncButton.dataset.accountId, syncButton.dataset.accountName);
+        return;
+    }
+    const deleteButton = event.target.closest('[data-account-delete]');
+    if (deleteButton) {
+        openDeleteAccountModal(deleteButton.dataset.accountId, deleteButton.dataset.accountName);
+    }
+});
+</script>
+{% endblock %}

@@ -1,0 +1,234 @@
+{% extends 'base.html' %}
+{% block title %}系统设置{% endblock %}
+
+{% block content %}
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; flex-wrap: wrap; gap: 0.75rem;">
+    <div>
+        <h2 style="font-size: 1.35rem; font-weight: 700; margin-bottom: 0;">系统设置</h2>
+        <span style="color: var(--text-muted); font-size: 0.85rem;">管理面板显示时区、初始化脚本库与管理员安全凭据</span>
+    </div>
+    <!-- 精炼的两大子项切换按钮 -->
+    <div style="display: flex; gap: 0.5rem;">
+        <a href="{{ url_for('settings_page', tab='general') }}" class="btn btn-outline {% if sub_tab == 'general' %}active{% endif %}">
+                常规设置
+        </a>
+        <a href="{{ url_for('settings_page', tab='user') }}" class="btn btn-outline {% if sub_tab == 'user' %}active{% endif %}">
+                用户设置
+        </a>
+    </div>
+</div>
+
+{% if sub_tab == 'general' %}
+<!-- ==================== 1. 常规设置 (负责时区、数据备份与恢复) ==================== -->
+<div style="max-width: 680px; margin: 0 auto; display: flex; flex-direction: column; gap: 1.25rem;">
+    <!-- 时区设置卡片 -->
+    <div class="card">
+        <div class="card-title">系统时区配置 (默认中国标准时间 GMT+8)</div>
+        <form method="post" id="form-update-tz" action="{{ url_for('settings_page', tab='general') }}">
+            <input type="hidden" name="action" value="update_timezone">
+            <div class="form-group">
+                <label class="form-label">面板显示时区</label>
+                <select name="timezone" class="form-control">
+                    <option value="Asia/Shanghai" {% if current_timezone == 'Asia/Shanghai' %}selected{% endif %}>中国标准时间 (北京时间 GMT+8)</option>
+                    <option value="Asia/Hong_Kong" {% if current_timezone == 'Asia/Hong_Kong' %}selected{% endif %}>中国香港时间 (GMT+8)</option>
+                    <option value="Asia/Taipei" {% if current_timezone == 'Asia/Taipei' %}selected{% endif %}>台北时间 (GMT+8)</option>
+                    <option value="Asia/Singapore" {% if current_timezone == 'Asia/Singapore' %}selected{% endif %}>新加坡时间 (GMT+8)</option>
+                    <option value="Asia/Tokyo" {% if current_timezone == 'Asia/Tokyo' %}selected{% endif %}>日本标准时间 (东京 GMT+9)</option>
+                    <option value="Asia/Seoul" {% if current_timezone == 'Asia/Seoul' %}selected{% endif %}>韩国标准时间 (首尔 GMT+9)</option>
+                    <option value="UTC" {% if current_timezone == 'UTC' %}selected{% endif %}>世界协调时间 (UTC+0)</option>
+                    <option value="Europe/London" {% if current_timezone == 'Europe/London' %}selected{% endif %}>伦敦时间 (GMT+0)</option>
+                    <option value="Europe/Paris" {% if current_timezone == 'Europe/Paris' %}selected{% endif %}>巴黎 / 中欧时间 (GMT+1)</option>
+                    <option value="America/New_York" {% if current_timezone == 'America/New_York' %}selected{% endif %}>美国东部时间 (GMT-5)</option>
+                    <option value="America/Los_Angeles" {% if current_timezone == 'America/Los_Angeles' %}selected{% endif %}>美国太平洋时间 (GMT-8)</option>
+                </select>
+                <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.4rem;">
+                修改后将即时影响活动日志流水、账号创建时间、脚本保存时间以及监控图表时间轴的格式化呈现。
+                </div>
+            </div>
+            <button type="submit" id="btn-save-tz" class="btn btn-primary" style="margin-top: 0.25rem;">
+                保存时区设置
+            </button>
+        </form>
+    </div>
+
+    <!-- 面板数据备份与恢复卡片 -->
+    <div class="card">
+        <div class="card-title">面板数据备份与恢复</div>
+        <div style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.5; margin-bottom: 1.25rem;">
+                导出包含所有已保存的 Azure 凭据、订阅列表、用户密码、初始化脚本模板及系统时区配置的完整数据库快照。
+        </div>
+
+        <div style="display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; padding-bottom: 1.25rem; border-bottom: 1px dashed var(--border-color);">
+            <a href="{{ url_for('download_backup') }}" class="btn btn-outline">
+                下载完整数据备份 (.db)
+            </a>
+            <span style="font-size: 0.8rem; color: var(--text-muted);">一键导出当前 SQLite 数据库快照</span>
+        </div>
+
+        <form method="post" id="form-restore-backup" action="{{ url_for('settings_page', tab='general') }}" enctype="multipart/form-data" style="margin-top: 1.25rem;" onsubmit="return confirm('警告：恢复备份将覆盖面板当前的全部数据（包括账号凭据与密码），确定继续吗？');">
+            <input type="hidden" name="action" value="restore_backup">
+            <div class="form-group" style="margin-bottom: 0.75rem;">
+                <label class="form-label">上传备份文件恢复</label>
+                <input type="file" name="backup_file" class="form-control" accept=".db" required style="padding: 0.35rem 0.5rem; font-size: 0.85rem;">
+            </div>
+            <button type="submit" id="btn-restore-backup" class="btn btn-warning">
+                上传并恢复数据
+            </button>
+        </form>
+    </div>
+</div>
+
+{% else %}
+<!-- ==================== 2. 用户设置 (负责初始化脚本库与密码修改，统一居中且与常规设置 680px 严格对齐) ==================== -->
+<div style="max-width: 680px; margin: 0 auto; display: flex; flex-direction: column; gap: 1.25rem;">
+    <!-- 模块 A: 初始化脚本库 -->
+    <div class="card">
+        <div class="card-title">
+            <span>用户初始化脚本库 (Cloud-Init / CustomData 预设)</span>
+            <button class="btn btn-primary btn-sm" onclick="openModal('add-script-modal')">+ 新建脚本</button>
+        </div>
+
+        {% if not scripts %}
+        <div style="text-align: center; padding: 2.5rem; color: var(--text-muted);">
+            <p style="margin-bottom: 0;">暂未保存任何脚本模板，可点击右上角「+ 新建脚本」添加</p>
+        </div>
+        {% else %}
+        <div class="table-responsive">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>脚本名称</th>
+                        <th class="table-description">说明描述</th>
+                        <th>保存时间</th>
+                        <th class="table-actions">操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for s in scripts %}
+                    <tr>
+                        <td><strong>{{ s.name }}</strong></td>
+                        <td class="table-description" style="color: var(--text-muted);">{{ s.description or '-' }}</td>
+                        <td style="color: var(--text-muted);">{{ s.created_at|format_dt }}</td>
+                        <td class="table-actions">
+                            <button type="button" class="btn btn-danger btn-xs" data-script-delete data-script-id="{{ s.id }}" data-script-name="{{ s.name|e }}">删除</button>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- 模块 B: 修改密码 (三个密码输入框采用统一单列 100% 宽度结构) -->
+    <div class="card">
+        <div class="card-title">修改管理员登录密码</div>
+        <form method="post" id="form-change-pwd" action="{{ url_for('settings_page', tab='user') }}" onsubmit="if(this.new_password.value !== this.confirm_password.value){ alert('两次输入的新密码不一致，请检查！'); return false; }">
+            <input type="hidden" name="action" value="change_password">
+            <div class="form-group">
+                <label class="form-label">当前旧密码</label>
+                <input type="password" name="old_password" class="form-control" placeholder="输入当前登录密码" required>
+            </div>
+            <div class="form-group">
+                <label class="form-label">新密码</label>
+                <input type="password" name="new_password" class="form-control" placeholder="输入新密码（至少 12 位）" minlength="12" required>
+                <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.4rem;">密码至少 12 位，并至少包含大写字母、小写字母、数字和特殊字符中的三类。</div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">确认新密码</label>
+                <input type="password" name="confirm_password" class="form-control" placeholder="再次输入新密码" minlength="12" required>
+            </div>
+            <button type="submit" id="btn-update-pwd" class="btn btn-primary" style="margin-top: 0.5rem;">
+                更新管理员密码
+            </button>
+        </form>
+    </div>
+</div>
+
+<!-- 添加脚本 Modal 弹窗 -->
+<div id="add-script-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 640px;">
+        <div class="modal-header">
+            <div class="modal-title">添加初始化脚本模板 (本地对称加密存储)</div>
+            <button type="button" class="modal-close" onclick="closeModal('add-script-modal')">&times;</button>
+        </div>
+        <form method="post" id="form-add-script" action="{{ url_for('settings_page', tab='user') }}">
+            <input type="hidden" name="action" value="add_script">
+            <div class="grid-2">
+                <div class="form-group">
+                    <label class="form-label">脚本名称</label>
+                    <input type="text" name="name" class="form-control" placeholder="例如: 基础环境初始化 / Docker一键安装" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">说明描述 (可选)</label>
+                    <input type="text" name="description" class="form-control" placeholder="例如: 包含更新源、安装 curl/git 与常用安全配置">
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">脚本内容 (Shell / PowerShell / Cloud-Init 原生脚本)</label>
+                <textarea name="content" class="form-control" rows="8" placeholder="#!/bin/bash&#10;apt-get update && apt-get install -y docker.io&#10;systemctl enable --now docker" required style="font-family: monospace; font-size: 0.85rem;"></textarea>
+            </div>
+
+            <div style="display: flex; justify-content: flex-end; gap: 0.75rem; margin-top: 1.5rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('add-script-modal')">取消</button>
+                <button type="submit" id="btn-save-script" class="btn btn-primary">
+                保存加密脚本
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- 删除脚本确认模态弹窗 -->
+<div id="delete-script-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 480px;">
+        <div class="modal-header">
+            <div class="modal-title" style="color: var(--danger);">删除初始化脚本</div>
+            <button type="button" class="modal-close" onclick="closeModal('delete-script-modal')">&times;</button>
+        </div>
+        <div style="font-size: 0.9rem; color: var(--text-main); margin-bottom: 1rem;">
+                确定要删除脚本模板 <strong id="delete-script-name"></strong> 吗？
+        </div>
+        <form method="post" id="form-delete-script" action="{{ url_for('settings_page', tab='user') }}">
+            <input type="hidden" name="action" value="delete_script">
+            <input type="hidden" name="script_id" id="delete-script-id" value="">
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('delete-script-modal')">取消</button>
+                <button type="submit" id="btn-confirm-del-script" class="btn btn-danger">确认删除</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endif %}
+
+<script>
+function openDeleteScriptModal(id, name) {
+    document.getElementById('delete-script-id').value = id;
+    document.getElementById('delete-script-name').textContent = name;
+    openModal('delete-script-modal');
+}
+
+// 所有设置表单先绘制锁定状态，再继续原生提交，避免跳转抢走动效。
+document.addEventListener('submit', function(e) {
+    const form = e.target;
+    if (!form || form.tagName !== 'FORM' || e.defaultPrevented) return;
+
+    let loadingText = '处理中...';
+    if (form.id === 'form-update-tz') loadingText = '保存中...';
+    else if (form.id === 'form-change-pwd') loadingText = '更新中...';
+    else if (form.id === 'form-restore-backup') loadingText = '正在恢复...';
+    else if (form.id === 'form-add-script') loadingText = '加密保存中...';
+    else if (form.id === 'form-delete-script') loadingText = '删除中...';
+
+    e.preventDefault();
+    submitFormAfterPaint(form, loadingText);
+});
+document.addEventListener('click', function(event) {
+    const button = event.target.closest('[data-script-delete]');
+    if (button) {
+        openDeleteScriptModal(button.dataset.scriptId, button.dataset.scriptName);
+    }
+});
+</script>
+{% endblock %}
