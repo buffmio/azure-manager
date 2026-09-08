@@ -30,7 +30,7 @@ Azure Manager 是一个自托管的 Microsoft Azure 多订阅运维管理面板�
   -> /app/data/database.db
 ```
 
-默认 Docker 启动命令使用 2 个 Gunicorn Worker、每个 Worker 2 个线程。SQLite 使用 WAL 模式，因此应用运行时必须将数据库文件及其 WAL 伴随文件保存在持久化存储中。
+默认 Docker 启动命令使用 1 个 Gunicorn Worker、2 个线程，适配 2C1G 主机并避免 SQLite 多进程写入竞争。SQLite 使用 WAL 模式，因此应用运行时必须将数据库文件及其 WAL 伴随文件保存在持久化存储中。
 
 ## 环境要求
 

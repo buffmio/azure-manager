@@ -278,19 +278,19 @@
             <div class="form-group" id="resize-options-field" style="display: none;">
                 <label class="form-label" for="resize-size-select">目标规格</label>
                 <select name="target_vm_size" id="resize-size-select" class="form-control" data-custom-dropdown style="display: none;" disabled required>
-                    <option value="">等待规格加载完成...</option>
+                    <option value="">正在加载规格...</option>
                 </select>
                 <div class="custom-dropdown-container" id="resize-size-custom-dropdown">
                     <div class="custom-dropdown-btn" id="resize-size-dropdown-btn" onclick="toggleResizeDropdown(event)" role="button" tabindex="0">
-                        <span id="resize-size-dropdown-label">等待规格加载完成...</span>
+                        <span id="resize-size-dropdown-label">正在加载规格...</span>
                         <svg viewBox="0 0 24 24" style="width: 14px; height: 14px; fill: var(--text-muted); flex-shrink: 0;"><path d="M7 10l5 5 5-5z"/></svg>
                     </div>
                     <div class="custom-dropdown-menu" id="resize-size-dropdown-menu">
-                        <div class="custom-dropdown-item disabled">等待规格加载完成...</div>
+                        <div class="custom-dropdown-item disabled">正在加载规格...</div>
                     </div>
                 </div>
                 <div id="resize-current-size" style="margin-top: 0.4rem; color: var(--text-muted); font-size: 0.8rem;"></div>
-                <div class="azure-form-status" id="resize-options-loading" style="display: none;"><span class="spec-loading-spinner" aria-hidden="true"></span><span class="spec-loading-label">加载中...</span></div>
+                <div class="azure-form-status" id="resize-options-loading" style="display: none;"><span class="spec-loading-spinner" aria-hidden="true"></span><span class="spec-loading-label">规格加载中...</span></div>
             </div>
 
             <div style="margin-top: 1rem; padding: 0.75rem; border: 1px solid #f59e0b; border-radius: 6px; background: #fffbeb; color: #92400e; font-size: 0.82rem; line-height: 1.6;">
@@ -597,13 +597,24 @@ function formatResizeSizeLabel(size, currentSize) {
     return `${size.name}${isCurrent ? '（当前规格）' : ''} · ${size.vcpus ?? size.number_of_cores ?? '-'} vCPU · ${size.memory_gib ?? formatResizeSizeMb(size.memory_in_mb)} GiB · ${monthly}`;
 }
 
+const NO_PUBLIC_PRICE_LABEL = 'Azure 未提供公开价格（不代表免费）';
+const NO_PUBLIC_PRICE_DETAIL = 'Azure 未提供该规格的公开价格，不代表免费；实际费用以 Azure Portal、合同价或账单为准';
+
+function hasPublicMonthlyPrice(size) {
+    const value = size?.monthly_price;
+    if (value === null || value === undefined || value === '') return false;
+    return Number.isFinite(Number(value));
+}
+
 function formatMonthlyPrice(size) {
     const value = size?.monthly_price;
-    if (value === null || value === undefined || value === '') return '月度价格暂无';
+    if (value === null || value === undefined || value === '' || !Number.isFinite(Number(value))) {
+        return 'Azure 未提供公开价格（不代表免费）';
+    }
     const numeric = Number(value);
     return Number.isFinite(numeric)
         ? `${size.currency || 'USD'} ${numeric.toFixed(2)}/月`
-        : '月度价格暂无';
+        : 'Azure 未提供公开价格（不代表免费）';
 }
 
 function formatResizeSizeDetails(size) {
@@ -622,6 +633,7 @@ function formatResizeSizeDetails(size) {
         `Hyper-V：${(size.hyperv_generations || []).join('、') || '-'}`,
         `可用区：${(size.availability_zones || []).join('、') || '-'}`,
     ];
+    if (!hasPublicMonthlyPrice(size)) details.push(NO_PUBLIC_PRICE_DETAIL);
     if (size.restriction_reasons && size.restriction_reasons.length) {
         details.push(`限制：${size.restriction_reasons.join('、')}`);
     }
@@ -682,11 +694,11 @@ function openResizeModal() {
     if (errorBox) { errorBox.style.display = 'none'; errorBox.textContent = ''; }
     if (field) field.style.display = 'block';
     // 加载期间保持规格选择框可见且可展开，提交按钮单独锁定，避免把“加载中”误显示成不可用。
-    if (select) { select.disabled = false; select.innerHTML = '<option value="">等待规格加载完成...</option>'; }
+    if (select) { select.disabled = false; select.innerHTML = '<option value="">正在加载规格...</option>'; }
     if (dropdown) dropdown.classList.remove('open');
     if (dropdownMenu) dropdownMenu.innerHTML = '';
-    setResizeDropdownState(false, '等待规格加载完成...');
-    if (dropdownMenu) dropdownMenu.innerHTML = '<div class="custom-dropdown-item disabled">等待规格加载完成...</div>';
+    setResizeDropdownState(false, '正在加载规格...');
+    if (dropdownMenu) dropdownMenu.innerHTML = '<div class="custom-dropdown-item disabled">正在加载规格...</div>';
     if (submit) submit.disabled = true;
 
     resizeOptionsRequest = fetch(`/api/sub/${VM_DETAIL_SUB_ID}/vm/${encodeURIComponent(VM_DETAIL_RESOURCE_GROUP)}/${encodeURIComponent(VM_DETAIL_NAME)}/resize_options`, { cache: 'no-store' })
@@ -722,18 +734,31 @@ function openResizeModal() {
             const sizes = Array.isArray(data.sizes) ? data.sizes : [];
             const currentSize = data.current_size || '';
             const targetSizes = sizes.filter(size =>
-                size.name && size.name.toLowerCase() !== currentSize.toLowerCase() && size.selectable !== false
+                size.name
+                && size.name.toLowerCase() !== currentSize.toLowerCase()
+                && size.selectable !== false
+                && hasPublicMonthlyPrice(size)
             );
             const hasSelectableTarget = targetSizes.length > 0;
             const hasRestrictedDisplay = sizes.some(size => size.selectable === false);
+            const hasUnpricedTarget = sizes.some(size =>
+                size.name
+                && size.name.toLowerCase() !== currentSize.toLowerCase()
+                && size.selectable !== false
+                && !hasPublicMonthlyPrice(size)
+            );
             if (!hasSelectableTarget) {
                 if (errorBox) {
-                    errorBox.textContent = hasRestrictedDisplay
+                    errorBox.textContent = hasUnpricedTarget
+                        ? (hasRestrictedDisplay
+                            ? '当前没有可选择且有公开价格的目标规格；受限或无公开价格规格不能提交'
+                            : '当前没有可选择且有公开价格的目标规格；无公开价格规格不能提交')
+                        : hasRestrictedDisplay
                         ? '当前没有可选择的目标规格；受限规格仍保留展示，不能提交'
                         : '该虚拟机没有可用的目标规格';
                     errorBox.style.display = 'block';
                 }
-                if (!hasRestrictedDisplay) {
+                if (!hasRestrictedDisplay && !hasUnpricedTarget) {
                     if (select) {
                         select.innerHTML = '';
                         select.disabled = true;
@@ -760,12 +785,13 @@ function openResizeModal() {
                         const isCurrent = size.name.toLowerCase() === currentSize.toLowerCase();
                         option.textContent = formatResizeSizeLabel(size, currentSize);
                         option.selected = isCurrent;
-                        option.disabled = size.selectable === false;
+                        const priceUnavailable = !isCurrent && !hasPublicMonthlyPrice(size);
+                        option.disabled = size.selectable === false || priceUnavailable;
                         select.appendChild(option);
 
                         if (dropdownMenu) {
                             const item = document.createElement('div');
-                            const disabled = size.selectable === false;
+                            const disabled = size.selectable === false || priceUnavailable;
                             item.className = `custom-dropdown-item${isCurrent ? ' selected' : ''}${disabled ? ' disabled' : ''}`;
                             item.textContent = option.textContent;
                             item.title = formatResizeSizeDetails(size);
@@ -785,7 +811,12 @@ function openResizeModal() {
                     });
                 });
                 select.disabled = false;
-                setResizeDropdownState(false, hasSelectableTarget ? undefined : '仅有受限规格');
+                setResizeDropdownState(
+                    false,
+                    hasSelectableTarget
+                        ? undefined
+                        : (hasRestrictedDisplay ? '仅有受限或无公开价格规格' : '仅有无公开价格规格')
+                );
                 select.onchange = () => {
                     if (submit) submit.disabled = select.value.toLowerCase() === currentSize.toLowerCase();
                 };

@@ -28,5 +28,5 @@ EXPOSE 8888
 
 USER azuremanager
 
-# 生产级 WSGI (Gunicorn + 2 Worker 进程 + 2 线程，适配 2C1G 低内存高并发环境)
-CMD ["gunicorn", "-w", "2", "--threads", "2", "-b", "0.0.0.0:8888", "--chdir", "/app/azure", "app:app"]
+# 2C1G：单 Worker 共享 SQLite 和连接缓存，少量线程处理 Azure I/O 等待。
+CMD ["gunicorn", "-w", "1", "--threads", "2", "-b", "0.0.0.0:8888", "--max-requests", "1000", "--max-requests-jitter", "50", "--chdir", "/app/azure", "app:app"]

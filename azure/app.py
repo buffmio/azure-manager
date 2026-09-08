@@ -64,6 +64,47 @@ def public_error_message(operation="Azure 操作"):
     return f"{operation}失败，请查看活动日志或稍后重试。"
 
 
+SKU_LOCATION_UNAVAILABLE_CODES = {
+    "LocationNotAvailableForResourceType",
+    "SubscriptionIsNotRegisteredForResourceType",
+    "SubscriptionNotRegisteredForResourceType",
+    "MissingSubscriptionRegistration",
+    "ResourceTypeNotSupported",
+}
+
+
+def _azure_error_code(error):
+    """兼容 Azure SDK 不同版本的错误码字段。"""
+    candidates = [
+        getattr(error, "error_code", None),
+        getattr(error, "code", None),
+        getattr(getattr(error, "error", None), "code", None),
+    ]
+    for candidate in candidates:
+        if candidate:
+            return str(candidate)
+    return ""
+
+
+def _is_sku_location_unavailable_error(error):
+    """只把 Azure 明确表示地域/订阅不可用的错误转换为业务空状态。"""
+    code = _azure_error_code(error)
+    if code in SKU_LOCATION_UNAVAILABLE_CODES:
+        return True
+    status_code = getattr(error, "status_code", None)
+    message = str(error or "").lower()
+    return status_code in {400, 409} and (
+        "location" in message
+        or "region" in message
+        or "subscription" in message
+        or "resource type" in message
+    )
+
+
+def sku_location_unavailable_message(location):
+    return "当前订阅未在该地域开放虚拟机服务，无法加载规格"
+
+
 def parse_bounded_int(raw_value, field_name, minimum, maximum, default=None):
     value = default if raw_value in (None, "") and default is not None else raw_value
     try:
@@ -356,9 +397,9 @@ def add_security_headers(response):
     return response
 
 
-AZURE_TASK_WORKERS_DEFAULT = 2
+AZURE_TASK_WORKERS_DEFAULT = 1
 AZURE_TASK_WORKERS_MIN = 1
-AZURE_TASK_WORKERS_MAX = 8
+AZURE_TASK_WORKERS_MAX = 2
 
 
 def resolve_azure_task_workers(raw_value=None) -> int:
@@ -812,6 +853,24 @@ def _sku_cache_payload(item):
     }
 
 
+def _sku_cache_has_selectable_sku(items):
+    """判断缓存中是否至少有一个当前订阅可选择的规格。"""
+    return any(
+        bool(item.architecture)
+        and not bool(_json_value(item.restriction_reasons_json, []))
+        for item in items
+    )
+
+
+def _sku_cache_unavailable_reason(items):
+    """提取全量规格受限时最有用的 Azure 限制原因。"""
+    for item in items:
+        reasons = _json_value(item.restriction_reasons_json, [])
+        if reasons:
+            return reasons[0]
+    return "NoSelectableVirtualMachineSku"
+
+
 def _save_sku_cache_entry(subscription_id, location, item):
     reasons = item.get("restriction_reasons") or []
     entry = SkuCache(
@@ -850,6 +909,55 @@ def _save_sku_cache_entry(subscription_id, location, item):
     )
     db.session.add(entry)
     return entry
+
+
+def _load_sku_catalog_for_resize(subscription, account, location):
+    """为调整规格复用按订阅/地域持久化的完整规格能力缓存。"""
+    loc = str(location or "").lower().replace(" ", "")
+    cache_expiry = datetime.utcnow() - timedelta(hours=24)
+    cached = SkuCache.query.filter_by(
+        subscription_id=subscription.id,
+        location=loc,
+    ).all()
+    fresh = [item for item in cached if item.updated_at and item.updated_at >= cache_expiry]
+    if fresh:
+        return {
+            item.name.lower(): _sku_cache_payload(item)
+            for item in fresh
+            if item.name
+        }
+
+    try:
+        fresh_skus = AzureService.fetch_and_cache_skus(
+            account.tenant_id, account.client_id, account.client_secret,
+            subscription.subscription_id, loc
+        )
+        SkuCache.query.filter_by(
+            subscription_id=subscription.id,
+            location=loc,
+        ).delete(synchronize_session=False)
+        for item in fresh_skus:
+            _save_sku_cache_entry(subscription.id, loc, item)
+        db.session.commit()
+        cached = SkuCache.query.filter_by(
+            subscription_id=subscription.id,
+            location=loc,
+        ).all()
+        return {
+            item.name.lower(): _sku_cache_payload(item)
+            for item in cached
+            if item.name
+        }
+    except Exception:
+        db.session.rollback()
+        if cached:
+            logger.warning("调整规格复用过期规格缓存：%s/%s", subscription.id, loc)
+            return {
+                item.name.lower(): _sku_cache_payload(item)
+                for item in cached
+                if item.name
+            }
+        raise
 
 
 def _enrich_sku_prices(subscription, location, skus, os_type, billing_mode, currency):
@@ -891,7 +999,11 @@ def _enrich_sku_prices(subscription, location, skus, os_type, billing_mode, curr
     price_error = None
     if missing:
         try:
-            records = AzureService.fetch_retail_prices(location, currency=currency)
+            records = AzureService.fetch_retail_prices(
+                location,
+                currency=currency,
+                sku_names=missing,
+            )
             for name in missing:
                 selected = select_retail_price(records, name, os_type, billing_mode)
                 hourly = float(selected["retailPrice"]) if selected else None
@@ -3373,6 +3485,16 @@ def api_get_skus(sub_id, location):
     ).all()
 
     if cached:
+        if not _sku_cache_has_selectable_sku(cached):
+            return jsonify({
+                "status": "unavailable",
+                "availability": "subscription",
+                "reason_code": _sku_cache_unavailable_reason(cached),
+                "message": "当前订阅在该地域没有可用虚拟机规格",
+                "billing_mode": billing_mode,
+                "os_type": os_type,
+                "skus": [],
+            })
         return jsonify({
             "status": "cached",
             "billing_mode": billing_mode,
@@ -3391,16 +3513,47 @@ def api_get_skus(sub_id, location):
             _save_sku_cache_entry(subscription.id, loc, item)
         db.session.commit()
 
+        if not fresh_skus:
+            return jsonify({
+                "status": "unavailable",
+                "availability": "subscription",
+                "reason_code": "NoVirtualMachineSku",
+                "message": sku_location_unavailable_message(loc),
+                "billing_mode": billing_mode,
+                "os_type": os_type,
+                "skus": [],
+            })
+
         cached_skus = SkuCache.query.filter_by(
             subscription_id=subscription.id,
             location=loc,
         ).all()
+        if not _sku_cache_has_selectable_sku(cached_skus):
+            return jsonify({
+                "status": "unavailable",
+                "availability": "subscription",
+                "reason_code": _sku_cache_unavailable_reason(cached_skus),
+                "message": "当前订阅在该地域没有可用虚拟机规格",
+                "billing_mode": billing_mode,
+                "os_type": os_type,
+                "skus": [],
+            })
         return jsonify({
             "status": "fresh", "billing_mode": billing_mode, "os_type": os_type,
             "skus": [_sku_cache_payload(item) for item in cached_skus],
         })
-    except Exception:
+    except Exception as error:
         logger.exception("规格缓存接口请求失败")
+        if _is_sku_location_unavailable_error(error):
+            return jsonify({
+                "status": "unavailable",
+                "availability": "subscription",
+                "reason_code": _azure_error_code(error) or "LocationUnavailable",
+                "message": sku_location_unavailable_message(loc),
+                "billing_mode": billing_mode,
+                "os_type": os_type,
+                "skus": [],
+            })
         return jsonify({"status": "error", "message": public_error_message("规格缓存请求")}), 500
 
 
@@ -3409,6 +3562,7 @@ def api_get_skus(sub_id, location):
 def api_get_sku_prices(sub_id, location):
     """只刷新价格字段，避免切换计费模式时重新传输和渲染规格目录。"""
     subscription = Subscription.query.get_or_404(sub_id)
+    account = subscription.account
     loc = location.lower().replace(" ", "")
     os_type = "Windows" if request.args.get("os_type", "Linux").lower() == "windows" else "Linux"
     billing_mode = "spot" if request.args.get("billing_mode", "on_demand").lower() == "spot" else "on_demand"
@@ -3420,13 +3574,56 @@ def api_get_sku_prices(sub_id, location):
         SkuCache.updated_at >= datetime.utcnow() - timedelta(hours=24),
     ).all()
     if not cached:
-        return jsonify({
-            "status": "success",
-            "source": "unavailable",
-            "os_type": os_type,
-            "billing_mode": billing_mode,
-            "prices": [],
-        })
+        # 浏览器可能仍命中 24 小时会话规格缓存，而服务端规格缓存刚好过期。
+        # 价格接口不能因此直接返回空列表，否则前端会把空价格记住到本次会话。
+        try:
+            fresh_skus = AzureService.fetch_and_cache_skus(
+                account.tenant_id, account.client_id, account.client_secret,
+                subscription.subscription_id, loc
+            )
+            SkuCache.query.filter_by(
+                subscription_id=subscription.id,
+                location=loc,
+            ).delete(synchronize_session=False)
+            for item in fresh_skus:
+                _save_sku_cache_entry(subscription.id, loc, item)
+            db.session.commit()
+            if not fresh_skus:
+                return jsonify({
+                    "status": "unavailable",
+                    "source": "unavailable",
+                    "availability": "subscription",
+                    "reason_code": "NoVirtualMachineSku",
+                    "message": sku_location_unavailable_message(loc),
+                    "os_type": os_type,
+                    "billing_mode": billing_mode,
+                    "prices": [],
+                })
+            cached = SkuCache.query.filter_by(
+                subscription_id=subscription.id,
+                location=loc,
+            ).all()
+        except Exception as error:
+            logger.exception("价格接口补充规格缓存失败：%s", loc)
+            db.session.rollback()
+            if _is_sku_location_unavailable_error(error):
+                return jsonify({
+                    "status": "unavailable",
+                    "source": "unavailable",
+                    "availability": "subscription",
+                    "reason_code": _azure_error_code(error) or "LocationUnavailable",
+                    "message": sku_location_unavailable_message(loc),
+                    "os_type": os_type,
+                    "billing_mode": billing_mode,
+                    "prices": [],
+                })
+            return jsonify({
+                "status": "success",
+                "source": "unavailable",
+                "os_type": os_type,
+                "billing_mode": billing_mode,
+                "prices": [],
+            })
 
     try:
         sku_payloads, price_error = _enrich_sku_prices(
@@ -3536,7 +3733,11 @@ def api_vm_resize_options(sub_id, resource_group, vm_name):
         else:
             options = AzureService.list_vm_resize_options(
                 account.tenant_id, account.client_id, account.client_secret,
-                subscription.subscription_id, resource_group, vm_name, use_cache=True
+                subscription.subscription_id, resource_group, vm_name,
+                use_cache=True,
+                resource_sku_provider=lambda location: _load_sku_catalog_for_resize(
+                    subscription, account, location
+                ),
             )
             if resize_cache is None:
                 resize_cache = VmResizeOptionsCache(

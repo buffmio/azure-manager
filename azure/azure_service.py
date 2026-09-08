@@ -270,10 +270,12 @@ class AzureService:
 
         sku_list = []
         for s in skus_iter:
-            if s.resource_type != "virtualMachines":
+            if str(getattr(s, "resource_type", "")).lower() != "virtualmachines":
                 continue
 
-            parsed = parse_resource_sku(s)
+            # 只应用当前地域的限制；否则一个 SKU 在其他地域的限制会被
+            # 错误地带入当前地域，导致可用规格被整体标成受限。
+            parsed = parse_resource_sku(s, location=loc)
             # 保留旧字段别名，页面和旧数据库迁移期间可以平滑切换。
             parsed["memory_gb"] = parsed["memory_gib"]
             parsed["accelerated_networking"] = parsed["accelerated_networking_supported"]
@@ -285,23 +287,27 @@ class AzureService:
         return sku_list
 
     @staticmethod
-    def _retail_price_filter(location: str) -> str:
+    def _retail_price_filter(location: str, sku_names=None) -> str:
         escaped_location = str(location).strip().lower().replace("'", "''")
+        # Retail Prices API 不接受多个 armSkuName 的 OR 组合过滤。
+        # 一次拉取指定地域的 Virtual Machines Consumption 目录，随后在本地
+        # 按 SKU、系统和计费模式选择，并由进程缓存复用目录结果。
         return (
             "serviceName eq 'Virtual Machines' and "
+            "priceType eq 'Consumption' and "
             f"armRegionName eq '{escaped_location}'"
         )
 
     @classmethod
-    def fetch_retail_prices(cls, location: str, currency: str = "USD") -> List[Dict[str, Any]]:
-        """读取 Azure Retail Prices，并按地域/币种缓存完整目录。"""
+    def fetch_retail_prices(cls, location: str, currency: str = "USD",
+                            sku_names=None) -> List[Dict[str, Any]]:
+        """按地域读取 Azure Retail Prices 目录，并按请求 SKU 在本地筛选。"""
         normalized_location = str(location).strip().lower().replace(" ", "")
         normalized_currency = str(currency or "USD").upper()
         cache_key = (normalized_location, normalized_currency)
         with cls._retail_prices_cache_lock:
             fetch_lock = cls._retail_prices_cache_locks.setdefault(cache_key, threading.Lock())
 
-        # 同一 worker 内的创建页首屏、计费切换和预热共享一次完整目录请求。
         with fetch_lock:
             now = time.monotonic()
             with cls._retail_prices_cache_lock:
@@ -379,7 +385,7 @@ class AzureService:
                 logger.warning(f"Scan image error for {pub}:{off} in {loc}: {e}")
                 return key, (pub, off, [])
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             for k, val in executor.map(scan_target, discovery_targets):
                 discovered_skus[k] = val
 
@@ -482,7 +488,7 @@ class AzureService:
         network_client = cls.get_network_client(tenant_id, client_id, client_secret, subscription_id)
 
         # 1. 并行拉取 VM 基础列表、Public IP 和 NIC
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             fut_vms = executor.submit(lambda: list(compute_client.virtual_machines.list_all()))
             fut_pips = executor.submit(lambda: list(network_client.public_ip_addresses.list_all()))
             fut_nics = executor.submit(lambda: list(network_client.network_interfaces.list_all()))
@@ -502,7 +508,7 @@ class AzureService:
                 except Exception:
                     return (v.id.lower(), None)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(vms_raw))) as iv_exec:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, len(vms_raw))) as iv_exec:
                 iv_pairs = list(iv_exec.map(fetch_single_iv, vms_raw))
                 for vid, iv_obj in iv_pairs:
                     if iv_obj:
@@ -866,7 +872,8 @@ class AzureService:
     @classmethod
     def list_vm_resize_options(cls, tenant_id: str, client_id: str, client_secret: str,
                                subscription_id: str, resource_group: str, vm_name: str,
-                               use_cache: bool = True) -> dict:
+                               use_cache: bool = True,
+                               resource_sku_provider=None) -> dict:
         cache_key = cls._vm_resize_options_cache_key(
             tenant_id, client_id, client_secret, subscription_id, resource_group, vm_name
         )
@@ -909,16 +916,28 @@ class AzureService:
         resize_metadata = {}
         resource_skus = getattr(compute_client, "resource_skus", None)
         vm_location = getattr(vm, "location", None)
-        if resource_skus is not None and vm_location and current_size:
+        if (
+            (resource_sku_provider is not None or resource_skus is not None)
+            and vm_location
+            and current_size
+        ):
             location = str(vm_location).lower().replace(" ", "")
             catalog_by_name = {}
-            for sku in resource_skus.list(filter=f"location eq '{location}'"):
-                if getattr(sku, "resource_type", None) != "virtualMachines":
-                    continue
-                parsed = parse_resource_sku(sku, location=location)
-                name = str(parsed.get("name") or "").lower()
-                if name:
-                    catalog_by_name[name] = parsed
+            if resource_sku_provider is not None:
+                provided_catalog = resource_sku_provider(location) or {}
+                catalog_by_name = {
+                    str(name).lower(): dict(item)
+                    for name, item in provided_catalog.items()
+                    if name and item
+                }
+            else:
+                for sku in resource_skus.list(filter=f"location eq '{location}'"):
+                    if getattr(sku, "resource_type", None) != "virtualMachines":
+                        continue
+                    parsed = parse_resource_sku(sku, location=location)
+                    name = str(parsed.get("name") or "").lower()
+                    if name:
+                        catalog_by_name[name] = parsed
 
             current_catalog = catalog_by_name.get(str(current_size).lower())
             current_architecture = normalize_architecture(
