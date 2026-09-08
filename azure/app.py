@@ -2649,102 +2649,9 @@ def vm_resize(sub_id, resource_group, vm_name):
     sub_pk = subscription.id
     subscription_azure_id = subscription.subscription_id
 
-    try:
-        options = AzureService.list_vm_resize_options(
-            tenant_id, client_id, client_secret, subscription_azure_id,
-            resource_group, vm_name, use_cache=False
-        )
-    except Exception:
-        logger.exception("实时检查虚拟机可调整规格失败：%s", vm_name)
-        return jsonify({
-            "status": "error",
-            "message": public_error_message("检查虚拟机可调整规格"),
-        }), 500
-
-    current_size = options.get("current_size") or ""
-    available_sizes = {
-        size["name"].lower(): size["name"]
-        for size in options.get("sizes", [])
-        if size.get("name")
-    }
-    canonical_target_size = available_sizes.get(target_vm_size.lower())
-    target_item = next(
-        (size for size in options.get("sizes", [])
-         if str(size.get("name", "")).strip().lower() == target_vm_size.lower()),
-        None,
-    )
-
-    if target_item and target_item.get("selectable") is False:
-        return jsonify({
-            "status": "error",
-            "message": "目标规格当前受限，仅展示不可选择",
-        }), 400
-
-    if not options.get("supported"):
-        normalized_power_state = (options.get("power_state") or "").strip().lower()
-        if normalized_power_state.startswith("vm "):
-            normalized_power_state = normalized_power_state[3:]
-        blocked_by_transitional_power_state = (
-            normalized_power_state in {"starting", "stopping", "deallocating"}
-            and (options.get("unsupported_reason") or "").startswith("虚拟机当前电源状态 ")
-        )
-        if blocked_by_transitional_power_state:
-            if target_vm_size.lower() == current_size.lower():
-                return jsonify({
-                    "status": "error",
-                    "message": "目标虚拟机规格与当前规格相同",
-                }), 400
-            if not canonical_target_size:
-                return jsonify({
-                    "status": "error",
-                    "message": "目标虚拟机规格不在该虚拟机的可调整规格列表中",
-                }), 400
-
-            active_task = DeploymentTask.query.filter(
-                DeploymentTask.subscription_id == sub_pk,
-                DeploymentTask.resource_group == resource_group,
-                DeploymentTask.target_name == vm_name,
-                DeploymentTask.status.in_(["Pending", "InProgress"]),
-                DeploymentTask.task_type.in_(VM_OPERATION_TASK_TYPES),
-            ).order_by(
-                DeploymentTask.created_at.desc(), DeploymentTask.id.desc()
-            ).first()
-            if active_task:
-                message = (
-                    f"虚拟机当前已有【{active_task.progress_msg or '已有操作正在执行'}】，"
-                    "已继续跟踪原任务。"
-                )
-                if request.headers.get("X-Requested-With") == "XMLHttpRequest" or request.is_json:
-                    return jsonify({
-                        "status": "in_progress",
-                        "task_id": active_task.id,
-                        "target_name": vm_name,
-                        "task_type": active_task.task_type,
-                        "message": message,
-                    })
-                flash(message, "warning")
-                return redirect(url_for(
-                    "vm_detail", sub_id=sub_id,
-                    resource_group=resource_group, vm_name=vm_name
-                ))
-
-        return jsonify({
-            "status": "error",
-            "message": options.get("unsupported_reason") or "当前虚拟机不支持调整规格",
-        }), 400
-
-    if target_vm_size.lower() == current_size.lower():
-        return jsonify({"status": "error", "message": "目标虚拟机规格与当前规格相同"}), 400
-
-    if not canonical_target_size:
-        return jsonify({
-            "status": "error",
-            "message": "目标虚拟机规格不在该虚拟机的可调整规格列表中",
-        }), 400
-
     reservation = reserve_vm_operation_task(
         sub_pk, resource_group, vm_name, "resize",
-        f"已提交调整规格至【{canonical_target_size}】的任务..."
+        f"已提交调整规格至【{target_vm_size}】的任务..."
     )
     task_id = reservation["task_id"]
     if not reservation["created"]:
@@ -2776,7 +2683,7 @@ def vm_resize(sub_id, resource_group, vm_name):
             try:
                 result = AzureService.resize_vm(
                     tenant_id, client_id, client_secret, subscription_azure_id,
-                    resource_group, vm_name, canonical_target_size,
+                    resource_group, vm_name, target_vm_size,
                     progress_callback=update_resize_progress
                 )
                 vm_cache = VmCache.query.filter_by(
