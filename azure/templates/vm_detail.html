@@ -635,7 +635,11 @@ function formatResizeSizeDetails(size) {
     ];
     if (!hasPublicMonthlyPrice(size)) details.push(NO_PUBLIC_PRICE_DETAIL);
     if (size.restriction_reasons && size.restriction_reasons.length) {
-        details.push(`限制：${size.restriction_reasons.join('、')}`);
+        const labels = size.restriction_reasons.map(reason => ({
+            TrustedLaunchUnsupported: '不支持 Trusted Launch',
+            TrustedLaunchSupportUnknown: '未确认 Trusted Launch 兼容性',
+        }[reason] || reason));
+        details.push(`限制：${labels.join('、')}`);
     }
     if (size.display_only) details.push('仅用于显示，Azure 当前未将其列入本机可调整集合');
     return details.join('；');
@@ -711,8 +715,9 @@ function openResizeModal() {
         .then(data => {
             const sourceLabel = data.source === 'azure' ? 'Azure 短时缓存' : (data.source || '未知');
             const cachedAt = data.cached_at ? new Date(Number(data.cached_at) * 1000).toLocaleString('zh-CN') : '未知';
+            const securityLabel = data.current_trusted_launch ? 'Trusted Launch' : (data.current_security_type || 'Standard');
             if (meta) {
-                meta.textContent = `规格来源：${sourceLabel} · 缓存时间：${cachedAt}`;
+                meta.textContent = `规格来源：${sourceLabel} · 缓存时间：${cachedAt} · 当前安全类型：${securityLabel}`;
                 meta.style.display = 'block';
             }
 

@@ -56,12 +56,25 @@ ALLOWED_FIREWALL_PROTOCOLS = {"Tcp", "Udp", "*"}
 ALLOWED_FIREWALL_ACCESS = {"Allow", "Deny"}
 ALLOWED_FIREWALL_DIRECTIONS = {"Inbound", "Outbound"}
 ALLOWED_SERVICE_TAGS = {"*", "Internet", "VirtualNetwork", "AzureLoadBalancer"}
-RETAIL_PRICE_CACHE_SOURCE = "azure_retail_prices_v2"
+RETAIL_PRICE_CACHE_SOURCE = "azure_retail_prices_v3"
+SKU_CATALOG_CACHE_HOURS = 1
 
 
 def public_error_message(operation="Azure 操作"):
     """给客户端返回固定的安全错误文本，详细异常只进入服务端日志。"""
     return f"{operation}失败，请查看活动日志或稍后重试。"
+
+
+def is_ajax_request():
+    return request.headers.get("X-Requested-With") == "XMLHttpRequest" or request.is_json
+
+
+def create_vm_request_error(message, status_code=400, subscription_id=None):
+    """创建页 AJAX 请求统一返回 JSON，普通表单仍保留页面重定向体验。"""
+    if is_ajax_request():
+        return jsonify({"status": "error", "message": message}), status_code
+    flash(message, "danger")
+    return redirect(url_for("create_vm_page", sub_id=subscription_id or request.args.get("sub_id", type=int)))
 
 
 SKU_LOCATION_UNAVAILABLE_CODES = {
@@ -817,8 +830,17 @@ def _json_value(value, default):
         return default
 
 
+def _sku_restriction_reasons(item):
+    reasons = _json_value(item.restriction_reasons_json, [])
+    if reasons:
+        return reasons
+    legacy = str(item.restrictions or "").strip()
+    return [legacy] if legacy else []
+
+
 def _sku_cache_payload(item):
     """输出规格统一模型；规格行只使用 name/vcpus/memory/monthly_price。"""
+    restriction_reasons = _sku_restriction_reasons(item)
     return {
         "name": item.name,
         "family": item.family or "",
@@ -845,10 +867,10 @@ def _sku_cache_payload(item):
         "availability_zones": _json_value(item.availability_zones_json, []),
         "capabilities": _json_value(item.capabilities_json, {}),
         "restrictions_detail": _json_value(item.restrictions_json, []),
-        "restriction_reasons": _json_value(item.restriction_reasons_json, []),
-        "restrictions": item.restrictions or "",
-        "restricted": bool(_json_value(item.restriction_reasons_json, [])),
-        "selectable": not bool(_json_value(item.restriction_reasons_json, [])),
+        "restriction_reasons": restriction_reasons,
+        "restrictions": item.restrictions or ", ".join(restriction_reasons),
+        "restricted": bool(restriction_reasons),
+        "selectable": not bool(restriction_reasons),
         "updated_at": item.updated_at.isoformat() if item.updated_at else None,
     }
 
@@ -857,7 +879,7 @@ def _sku_cache_has_selectable_sku(items):
     """判断缓存中是否至少有一个当前订阅可选择的规格。"""
     return any(
         bool(item.architecture)
-        and not bool(_json_value(item.restriction_reasons_json, []))
+        and not _sku_restriction_reasons(item)
         for item in items
     )
 
@@ -865,7 +887,7 @@ def _sku_cache_has_selectable_sku(items):
 def _sku_cache_unavailable_reason(items):
     """提取全量规格受限时最有用的 Azure 限制原因。"""
     for item in items:
-        reasons = _json_value(item.restriction_reasons_json, [])
+        reasons = _sku_restriction_reasons(item)
         if reasons:
             return reasons[0]
     return "NoSelectableVirtualMachineSku"
@@ -873,6 +895,8 @@ def _sku_cache_unavailable_reason(items):
 
 def _save_sku_cache_entry(subscription_id, location, item):
     reasons = item.get("restriction_reasons") or []
+    if isinstance(reasons, str):
+        reasons = [reasons] if reasons.strip() else []
     entry = SkuCache(
         subscription_id=subscription_id,
         location=location,
@@ -906,6 +930,7 @@ def _save_sku_cache_entry(subscription_id, location, item):
         capabilities_json=json.dumps(item.get("capabilities", {}), ensure_ascii=False),
         restrictions_json=json.dumps(item.get("restrictions_detail", item.get("restrictions", [])), ensure_ascii=False),
         restriction_reasons_json=json.dumps(reasons, ensure_ascii=False),
+        restrictions=", ".join(reasons),
     )
     db.session.add(entry)
     return entry
@@ -914,7 +939,7 @@ def _save_sku_cache_entry(subscription_id, location, item):
 def _load_sku_catalog_for_resize(subscription, account, location):
     """为调整规格复用按订阅/地域持久化的完整规格能力缓存。"""
     loc = str(location or "").lower().replace(" ", "")
-    cache_expiry = datetime.utcnow() - timedelta(hours=24)
+    cache_expiry = datetime.utcnow() - timedelta(hours=SKU_CATALOG_CACHE_HOURS)
     cached = SkuCache.query.filter_by(
         subscription_id=subscription.id,
         location=loc,
@@ -983,10 +1008,7 @@ def _enrich_sku_prices(subscription, location, skus, os_type, billing_mode, curr
             return False
         # 没有价格也是有效结果，短期内不应因同一批无报价 SKU 重复请求 Azure。
         if row.hourly_price is None:
-            return (
-                row.price_type == "unavailable"
-                and row.source == RETAIL_PRICE_CACHE_SOURCE
-            )
+            return row.price_type == "unavailable" and bool(row.source)
         if row.monthly_price is None:
             return False
         try:
@@ -1300,6 +1322,13 @@ login_manager = LoginManager(app)
 login_manager.login_view = "login"
 login_manager.login_message = "请先登录管理面板。"
 login_manager.login_message_category = "warning"
+
+
+@login_manager.unauthorized_handler
+def handle_unauthorized_request():
+    if is_ajax_request():
+        return jsonify({"status": "error", "message": "登录已过期，请重新登录"}), 401
+    return redirect(url_for("login", next=request.url))
 
 CSRF_SESSION_KEY = "_csrf_token"
 
@@ -1769,6 +1798,7 @@ def create_vm_page():
     account = subscription.account
 
     if request.method == "POST":
+        reject = lambda message: create_vm_request_error(message, subscription_id=subscription.id)
         vm_prefix = request.form.get("name", "").strip().lower()
         location = request.form.get("location", "eastasia")
         vm_size = request.form.get("vm_size", "Standard_B1s")
@@ -1797,8 +1827,7 @@ def create_vm_page():
                 auth_type, admin_password_confirm
             )
         except ValueError as exc:
-            flash(str(exc), "danger")
-            return redirect(url_for("create_vm_page", sub_id=subscription.id))
+            return reject(str(exc))
 
         accelerated_networking = (request.form.get("accelerated_networking") == "true")
         spot_instance = (request.form.get("spot_instance") == "true")
@@ -1811,25 +1840,22 @@ def create_vm_page():
             subscription_id=subscription.id, location=location_key, name=vm_size
         ).first()
         if not selected_sku:
-            flash("所选虚拟机规格已过期，请重新加载当前地域的规格列表", "danger")
-            return redirect(url_for("create_vm_page", sub_id=subscription.id))
-        if selected_sku.restrictions:
-            flash("所选虚拟机规格当前受限，无法创建", "danger")
-            return redirect(url_for("create_vm_page", sub_id=subscription.id))
+            return reject("所选虚拟机规格已过期，请重新加载当前地域的规格列表")
+        if not selected_sku.updated_at or selected_sku.updated_at < datetime.utcnow() - timedelta(hours=SKU_CATALOG_CACHE_HOURS):
+            return reject("规格可用性探测已过期，请重新加载当前地域的规格列表")
+        selected_restrictions = _sku_restriction_reasons(selected_sku)
+        if selected_sku.restrictions or selected_restrictions:
+            return reject("所选虚拟机规格当前受限，无法创建")
         if not selected_sku.architecture:
-            flash("所选规格缺少 Azure 架构信息，请重新加载规格列表", "danger")
-            return redirect(url_for("create_vm_page", sub_id=subscription.id))
+            return reject("所选规格缺少 Azure 架构信息，请重新加载规格列表")
         if spot_instance and selected_sku.spot_capable is not True:
-            flash("所选规格或当前订阅不支持 Spot 抢占式计费", "danger")
-            return redirect(url_for("create_vm_page", sub_id=subscription.id))
+            return reject("所选规格或当前订阅不支持 Spot 抢占式计费")
         if accelerated_networking and selected_sku.accelerated_networking_supported is not True:
-            flash("所选规格不支持网络加速", "danger")
-            return redirect(url_for("create_vm_page", sub_id=subscription.id))
+            return reject("所选规格不支持网络加速")
         if selected_sku.accelerated_networking_required is True:
             accelerated_networking = True
         if accelerated_networking and custom_image_urn:
-            flash("自定义镜像无法确认网络加速驱动，请使用官方动态镜像或关闭网络加速", "danger")
-            return redirect(url_for("create_vm_page", sub_id=subscription.id))
+            return reject("自定义镜像无法确认网络加速驱动，请使用官方动态镜像或关闭网络加速")
         selected_image_architecture = selected_sku.architecture
 
         if not custom_image_urn:
@@ -1841,21 +1867,16 @@ def create_vm_page():
                 chosen_image = cached_image.urn
                 selected_image_architecture = cached_image.architecture
                 if auth_type == "ssh_key" and (cached_image.os_type or "").lower() == "windows":
-                    flash("Windows 镜像不支持仅使用 SSH 公钥认证，请改用密码认证", "danger")
-                    return redirect(url_for("create_vm_page", sub_id=subscription.id))
+                    return reject("Windows 镜像不支持仅使用 SSH 公钥认证，请改用密码认证")
             elif cached_image:
-                flash("当前镜像缓存缺少真实 URN，请重新加载镜像列表", "danger")
-                return redirect(url_for("create_vm_page", sub_id=subscription.id))
+                return reject("当前镜像缓存缺少真实 URN，请重新加载镜像列表")
             else:
-                flash("所选动态镜像不在当前地域缓存中，请重新加载镜像列表", "danger")
-                return redirect(url_for("create_vm_page", sub_id=subscription.id))
+                return reject("所选动态镜像不在当前地域缓存中，请重新加载镜像列表")
         elif auth_type == "ssh_key" and "windows" in custom_image_urn.lower():
-            flash("Windows 镜像不支持仅使用 SSH 公钥认证，请改用密码认证", "danger")
-            return redirect(url_for("create_vm_page", sub_id=subscription.id))
+            return reject("Windows 镜像不支持仅使用 SSH 公钥认证，请改用密码认证")
 
         if not admin_password and not ssh_public_key:
-            flash("必须提供管理员密码或 SSH 公钥之一", "danger")
-            return redirect(url_for("create_vm_page", sub_id=subscription.id))
+            return reject("必须提供管理员密码或 SSH 公钥之一")
 
         tenant_id = account.tenant_id
         client_id = account.client_id
@@ -1958,7 +1979,7 @@ def create_vm_page():
             if reservation["created"]:
                 submit_background_task(async_deploy, tag, reservation["task_id"], task_id=reservation["task_id"])
 
-        if request.headers.get("X-Requested-With") == "XMLHttpRequest" or request.is_json:
+        if is_ajax_request():
             return jsonify({
                 "status": "submitted",
                 "tasks": created_tasks,
@@ -3402,7 +3423,7 @@ def api_get_skus(sub_id, location):
     cached = SkuCache.query.filter(
         SkuCache.subscription_id == subscription.id,
         SkuCache.location == loc,
-        SkuCache.updated_at >= datetime.utcnow() - timedelta(hours=24)
+        SkuCache.updated_at >= datetime.utcnow() - timedelta(hours=SKU_CATALOG_CACHE_HOURS)
     ).all()
 
     if cached:
@@ -3492,10 +3513,10 @@ def api_get_sku_prices(sub_id, location):
     cached = SkuCache.query.filter(
         SkuCache.subscription_id == subscription.id,
         SkuCache.location == loc,
-        SkuCache.updated_at >= datetime.utcnow() - timedelta(hours=24),
+        SkuCache.updated_at >= datetime.utcnow() - timedelta(hours=SKU_CATALOG_CACHE_HOURS),
     ).all()
     if not cached:
-        # 浏览器可能仍命中 24 小时会话规格缓存，而服务端规格缓存刚好过期。
+        # 浏览器可能仍命中短时会话规格缓存，而服务端规格缓存刚好过期。
         # 价格接口不能因此直接返回空列表，否则前端会把空价格记住到本次会话。
         try:
             fresh_skus = AzureService.fetch_and_cache_skus(
@@ -3656,9 +3677,6 @@ def api_vm_resize_options(sub_id, resource_group, vm_name):
                 account.tenant_id, account.client_id, account.client_secret,
                 subscription.subscription_id, resource_group, vm_name,
                 use_cache=True,
-                resource_sku_provider=lambda location: _load_sku_catalog_for_resize(
-                    subscription, account, location
-                ),
             )
             if resize_cache is None:
                 resize_cache = VmResizeOptionsCache(

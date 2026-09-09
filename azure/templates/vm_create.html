@@ -117,7 +117,7 @@
                         </div>
                         <div class="azure-form-status" id="sku-loading" style="display: none;"><span class="spec-loading-spinner" aria-hidden="true"></span><span class="spec-loading-label">规格加载中...</span></div>
                         <div class="azure-form-status" id="price-loading" style="display: none;"><span class="spec-loading-spinner" aria-hidden="true"></span><span class="spec-loading-label">价格加载中...</span></div>
-                        <div class="azure-form-help">优先显示常用规格；受限规格会标记并禁止选择。</div>
+                        <div class="azure-form-help">优先显示常用规格；受限规格会标记并禁止选择。可用性为订阅/地域探测结果，最终以 Azure 创建结果为准。</div>
                     </div>
                 </div>
             </section>
@@ -254,7 +254,7 @@ document.getElementById('create-vm-form').addEventListener('submit', function(e)
         body: formData,
         headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRF-Token': '{{ csrf_token }}' }
     })
-    .then(res => res.json().then(data => ({ ok: res.ok, data })))
+    .then(res => readJsonResponse(res, '创建接口未返回 JSON').then(data => ({ ok: res.ok, data })))
     .then(({ ok, data }) => {
         if (!ok || data.status !== 'submitted' || !data.first_task_id) {
             throw new Error(data.message || '创建任务提交失败');
@@ -460,6 +460,8 @@ function hasPublicMonthlyPrice(sku) {
 }
 
 function formatMonthlyPrice(sku) {
+    if (sku?.price_status === 'loading') return '价格加载中...';
+    if (sku?.price_status === 'error') return '价格暂时无法获取';
     const value = sku?.monthly_price;
     if (value === null || value === undefined || value === '' || !Number.isFinite(Number(value))) {
         return 'Azure 未提供公开价格（不代表免费）';
@@ -486,11 +488,24 @@ function formatCreateSkuDetails(sku) {
         `Hyper-V：${(sku.hyperv_generations || []).join('、') || '-'}`,
         `可用区：${(sku.availability_zones || []).join('、') || '-'}`,
     ];
-    if (!hasPublicMonthlyPrice(sku)) details.push(NO_PUBLIC_PRICE_DETAIL);
+    if (sku?.price_status === 'loading') details.push('价格加载中，请稍候');
+    else if (sku?.price_status === 'error') details.push('价格暂时无法获取，请稍后重试；实际费用以 Azure Portal、合同价或账单为准');
+    else if (!hasPublicMonthlyPrice(sku)) details.push(NO_PUBLIC_PRICE_DETAIL);
     if (sku.restriction_reasons && sku.restriction_reasons.length) {
         details.push(`限制：${sku.restriction_reasons.join('、')}`);
     }
     return details.join('；');
+}
+
+async function readJsonResponse(response, fallbackMessage) {
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.toLowerCase().includes('application/json')) {
+        if (response.redirected && /\/login(?:\?|$)/.test(response.url || '')) {
+            throw new Error('登录已过期，请重新登录');
+        }
+        throw new Error(`${fallbackMessage}（HTTP ${response.status}）`);
+    }
+    return response.json();
 }
 
 function toggleAcceleratedNetworking(enabled) {
@@ -562,7 +577,7 @@ function applySkuPrices(prices) {
     (prices || []).forEach(sku => {
         const name = String(sku.name || '').toLowerCase();
         if (!name) return;
-        skuDataByName[name] = { ...(skuDataByName[name] || {}), ...sku };
+        skuDataByName[name] = { ...(skuDataByName[name] || {}), ...sku, price_status: 'ready' };
     });
     document.querySelectorAll('[data-sku-name]').forEach(item => {
         const sku = skuDataByName[item.dataset.skuName.toLowerCase()];
@@ -603,7 +618,7 @@ function rememberSkuPrices(location, osType, billing, skus) {
     }));
 }
 
-const SKU_BROWSER_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const SKU_BROWSER_CACHE_TTL_MS = 10 * 60 * 1000;
 
 function skuBrowserCacheKey(location) {
     return `azure-manager:sku-cache:{{ subscription.id }}:${String(location).toLowerCase()}`;
@@ -677,15 +692,22 @@ function requestSkuPrices(location, osType, billing) {
     const controller = typeof AbortController === 'function' ? new AbortController() : null;
     const fetchOptions = { cache: 'no-store' };
     if (controller) fetchOptions.signal = controller.signal;
+    const timeoutId = controller ? setTimeout(() => controller.abort(), 18000) : null;
     skuPriceControllers[key] = controller;
     const request = fetch(`/api/sub/{{ subscription.id }}/sku_prices/${location}?os_type=${encodeURIComponent(osType)}&billing_mode=${billing}`, fetchOptions)
-        .then(res => res.json())
+        .then(res => readJsonResponse(res, '价格接口未返回 JSON'))
         .then(data => {
             if (data.status !== 'success') throw new Error(data.message || '价格加载失败');
+            if (data.price_error) {
+                const error = new Error(data.price_error);
+                error.code = 'PRICE_UNAVAILABLE';
+                throw error;
+            }
             rememberSkuPrices(location, osType, billing, data.prices || []);
             return skuPriceCache[key];
         })
         .finally(() => {
+            if (timeoutId) clearTimeout(timeoutId);
             delete skuPriceRequests[key];
             delete skuPriceControllers[key];
         });
@@ -716,13 +738,18 @@ function refreshSkuPrices() {
                 console.warn('Failed to load SKU prices:', error);
             }
             if (getCurrentSkuPriceContext().key === key) {
-                if (skuLabel) skuLabel.textContent = '价格加载失败';
-                if (skuMenu) {
-                    skuMenu.innerHTML = '<div class="custom-dropdown-item disabled">价格加载失败，请重试</div>';
-                    skuMenu.style.visibility = 'visible';
-                }
-                const hiddenSku = document.getElementById('sku-input-hidden');
-                if (hiddenSku) hiddenSku.value = '';
+                const temporary = error?.code === 'PRICE_UNAVAILABLE' || error?.name === 'AbortError';
+                const message = temporary ? '价格暂时无法获取' : '价格加载失败，请重试';
+                document.querySelectorAll('[data-sku-name]').forEach(item => {
+                    const skuName = item.dataset.skuName || '';
+                    const sku = skuDataByName[skuName.toLowerCase()];
+                    if (!sku) return;
+                    sku.price_status = 'error';
+                    item.textContent = formatCreateSkuLabel(sku);
+                    item.title = formatCreateSkuDetails(sku);
+                });
+                if (skuLabel) skuLabel.textContent = message;
+                if (skuMenu) skuMenu.style.visibility = 'visible';
             }
             return false;
         })
@@ -910,8 +937,9 @@ function renderSkusForLocation(data, location, requestSequence) {
         }));
 
         skus.forEach(sku => {
-            skuDataByName[sku.name.toLowerCase()] = sku;
-            const displayLabel = formatCreateSkuLabel(sku);
+            const displaySku = { ...sku, price_status: 'loading' };
+            skuDataByName[sku.name.toLowerCase()] = displaySku;
+            const displayLabel = formatCreateSkuLabel(displaySku);
             const isArm = sku.architecture === 'arm64';
             skuArchitectureByName[sku.name] = sku.architecture || '';
             const itemObj = {
@@ -919,7 +947,7 @@ function renderSkusForLocation(data, location, requestSequence) {
                 label: displayLabel,
                 isArm: isArm,
                 disabled: !isSelectableSku(sku),
-                details: formatCreateSkuDetails(sku)
+                details: formatCreateSkuDetails(displaySku)
             };
 
             if (groupDefinitions[0].match(sku)) {
@@ -994,6 +1022,7 @@ function renderSkusForLocation(data, location, requestSequence) {
             }
 
             loadingText.style.display = 'none';
+            menu.style.visibility = 'visible';
             if (!foundSelected && firstValidItem) {
                 if (firstValidItemElement) firstValidItemElement.classList.add('selected');
                 selectSkuOption(firstValidItem.name, firstValidItem.label, firstValidItem.isArm);
@@ -1009,9 +1038,6 @@ function renderSkusForLocation(data, location, requestSequence) {
                     menu.style.visibility = 'visible';
                     return;
                 }
-                if (hiddenInput) hiddenInput.value = '';
-                if (labelSpan) labelSpan.textContent = '价格加载失败';
-                menu.innerHTML = '<div class="custom-dropdown-item disabled">价格加载失败，请重试</div>';
                 menu.style.visibility = 'visible';
             }).finally(() => scheduleAlternateSkuPricePrewarm());
         };
@@ -1038,7 +1064,7 @@ function loadSkusForLocation(location, requestSequence) {
     }
 
     fetch(`/api/sub/{{ subscription.id }}/skus/${location}`)
-        .then(async res => ({ ok: res.ok, data: await res.json() }))
+        .then(async res => ({ ok: res.ok, data: await readJsonResponse(res, '规格接口未返回 JSON') }))
         .then(({ ok, data }) => {
             if (data.status === 'unavailable') {
                 renderUnavailableSkuState(data, requestSequence);

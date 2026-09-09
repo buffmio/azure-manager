@@ -24,7 +24,11 @@ from azure.mgmt.consumption import ConsumptionManagementClient
 try:
     from .sku_catalog import parse_resource_sku, filter_resize_candidates, normalize_architecture
 except ImportError:
-    from sku_catalog import parse_resource_sku, filter_resize_candidates, normalize_architecture
+    from sku_catalog import (
+        parse_resource_sku,
+        filter_resize_candidates,
+        normalize_architecture,
+    )
 
 logger = logging.getLogger("azure_service")
 
@@ -40,6 +44,7 @@ def _resolve_azure_timeout():
 AZURE_OPERATION_TIMEOUT_SECONDS = _resolve_azure_timeout()
 VM_RESIZE_OPTIONS_CACHE_TTL_SECONDS = 60
 RETAIL_PRICES_CACHE_TTL_SECONDS = 6 * 60 * 60
+RETAIL_PRICES_TOTAL_TIMEOUT_SECONDS = 20
 AZURE_RETAIL_PRICES_URL = "https://prices.azure.com/api/retail/prices"
 
 
@@ -302,11 +307,16 @@ class AzureService:
         # Retail Prices API 不接受多个 armSkuName 的 OR 组合过滤。
         # 一次拉取指定地域的 Virtual Machines Consumption 目录，随后在本地
         # 按 SKU、系统和计费模式选择，并由进程缓存复用目录结果。
-        return (
+        price_filter = (
             "serviceName eq 'Virtual Machines' and "
             "priceType eq 'Consumption' and "
             f"armRegionName eq '{escaped_location}'"
         )
+        requested_names = [str(name).strip() for name in (sku_names or []) if str(name).strip()]
+        if len(requested_names) == 1:
+            escaped_sku = requested_names[0].replace("'", "''")
+            price_filter += f" and armSkuName eq '{escaped_sku}'"
+        return price_filter
 
     @classmethod
     def fetch_retail_prices(cls, location: str, currency: str = "USD",
@@ -314,7 +324,9 @@ class AzureService:
         """按地域读取 Azure Retail Prices 目录，并按请求 SKU 在本地筛选。"""
         normalized_location = str(location).strip().lower().replace(" ", "")
         normalized_currency = str(currency or "USD").upper()
-        cache_key = (normalized_location, normalized_currency)
+        requested_names = tuple(sorted({str(name).strip().lower() for name in (sku_names or []) if str(name).strip()}))
+        cache_scope = requested_names[0] if len(requested_names) == 1 else "region"
+        cache_key = (normalized_location, normalized_currency, cache_scope)
         with cls._retail_prices_cache_lock:
             fetch_lock = cls._retail_prices_cache_locks.setdefault(cache_key, threading.Lock())
 
@@ -329,13 +341,20 @@ class AzureService:
             params = {
                 "api-version": "2023-01-01-preview",
                 "currencyCode": normalized_currency,
-                "$filter": cls._retail_price_filter(normalized_location),
+                "$filter": cls._retail_price_filter(
+                    normalized_location,
+                    sku_names=sku_names,
+                ),
             }
             records = []
+            deadline = time.monotonic() + RETAIL_PRICES_TOTAL_TIMEOUT_SECONDS
             while url:
                 response = None
                 for attempt in range(3):
-                    response = requests.get(url, params=params, timeout=30)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Azure Retail Prices 请求超时")
+                    response = requests.get(url, params=params, timeout=min(30, remaining))
                     if response.status_code != 429 or attempt == 2:
                         break
                     retry_after = response.headers.get("Retry-After", "1")
@@ -343,7 +362,7 @@ class AzureService:
                         delay = min(max(float(retry_after), 0.5), 5.0)
                     except (TypeError, ValueError):
                         delay = 1.0
-                    time.sleep(delay)
+                    time.sleep(min(delay, max(0, deadline - time.monotonic())))
                 response.raise_for_status()
                 payload = response.json() or {}
                 records.extend(payload.get("Items") or payload.get("items") or [])
@@ -933,6 +952,8 @@ class AzureService:
         ):
             location = str(vm_location).lower().replace(" ", "")
             catalog_by_name = {}
+            vm_zones = getattr(vm, "zones", None) or []
+            current_zone = str(vm_zones[0]) if vm_zones else None
             if resource_sku_provider is not None:
                 provided_catalog = resource_sku_provider(location) or {}
                 catalog_by_name = {
@@ -944,7 +965,7 @@ class AzureService:
                 for sku in resource_skus.list(filter=f"location eq '{location}'"):
                     if getattr(sku, "resource_type", None) != "virtualMachines":
                         continue
-                    parsed = parse_resource_sku(sku, location=location)
+                    parsed = parse_resource_sku(sku, location=location, zone=current_zone)
                     name = str(parsed.get("name") or "").lower()
                     if name:
                         catalog_by_name[name] = parsed
@@ -979,12 +1000,17 @@ class AzureService:
                         logger.warning("读取 VM 网卡网络加速状态失败：%s", exc)
                 billing_raw = str(getattr(vm, "priority", "") or "").lower()
                 current_billing_mode = "spot" if "spot" in billing_raw else "on_demand"
+                security_profile = getattr(vm, "security_profile", None)
+                security_type = getattr(security_profile, "security_type", None)
+                security_type = getattr(security_type, "value", security_type)
+                current_trusted_launch = str(security_type or "").lower().replace("_", "") == "trustedlaunch"
                 candidates = filter_resize_candidates(
                     available_sizes,
                     current_architecture,
                     catalog_by_name,
                     current_nic_accelerated=current_nic_accelerated,
                     current_billing_mode=current_billing_mode,
+                    current_trusted_launch=current_trusted_launch,
                 )
                 enriched_sizes = [cls._resize_size_payload(item) for item in candidates]
                 disk = getattr(getattr(vm, "storage_profile", None), "os_disk", None)
@@ -997,6 +1023,9 @@ class AzureService:
                     "current_nic_accelerated_networking": current_nic_accelerated,
                     "current_os_type": "Windows" if "windows" in str(raw_os).lower() else "Linux",
                     "current_billing_mode": "spot" if "spot" in billing_raw else "on_demand",
+                    "current_security_type": str(security_type or "Standard"),
+                    "current_trusted_launch": current_trusted_launch,
+                    "current_zone": current_zone,
                 }
 
         result = {
@@ -1329,7 +1358,8 @@ class AzureService:
             ManagedDiskParameters, StorageAccountTypes,
             OSProfile, LinuxConfiguration, SshConfiguration, SshPublicKey,
             NetworkProfile, NetworkInterfaceReference,
-            BillingProfile, VirtualMachinePriorityTypes, VirtualMachineEvictionPolicyTypes
+            BillingProfile, VirtualMachinePriorityTypes, VirtualMachineEvictionPolicyTypes,
+            SecurityProfile,
         )
 
         # 检测所选规格是否为 Azure ARM 架构规格 (Ampere Altra)
@@ -1408,7 +1438,10 @@ class AzureService:
             hardware_profile=HardwareProfile(vm_size=vm_size),
             storage_profile=storage_prof,
             os_profile=os_prof,
-            network_profile=net_prof
+            network_profile=net_prof,
+            # 创建页没有 Trusted Launch 选项，显式使用普通安全类型，
+            # 避免 Azure 新 API 对符合条件的镜像隐式启用 Trusted Launch。
+            security_profile=SecurityProfile(security_type="Standard"),
         )
 
         if spot_instance:

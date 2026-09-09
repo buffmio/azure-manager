@@ -60,6 +60,26 @@ def normalize_architecture(value: Any) -> Optional[str]:
     return None
 
 
+def supports_trusted_launch(catalog: Mapping[str, Any]) -> Optional[bool]:
+    """Return explicit Trusted Launch support, or None when Azure omitted it."""
+    explicit = catalog.get("trusted_launch_supported")
+    if explicit is not None:
+        return _boolean(explicit)
+
+    capabilities = catalog.get("capabilities") or {}
+    if not isinstance(capabilities, Mapping):
+        capabilities = _capability_map(capabilities)
+    normalized = {str(key).lower(): value for key, value in capabilities.items()}
+
+    disabled = _boolean(normalized.get("trustedlaunchdisabled"))
+    if disabled is not None:
+        return not disabled
+    supported = _boolean(normalized.get("trustedlaunchsupported"))
+    if supported is not None:
+        return supported
+    return None
+
+
 def _capability_map(capabilities: Iterable[Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for capability in capabilities or []:
@@ -101,9 +121,14 @@ def _location_info(value: Any) -> Any:
 
 def _restriction_applies(restriction: Mapping[str, Any], location: Optional[str] = None,
                          zone: Optional[str] = None) -> bool:
+    restriction_type = str(restriction.get("type") or "").strip().lower()
     info = restriction.get("restriction_info") or {}
     locations = {str(item).lower().replace(" ", "") for item in info.get("locations", []) or []}
     zones = {str(item).lower() for item in info.get("zones", []) or []}
+    # A Zone restriction cannot be promoted to a region-wide restriction when
+    # the caller did not select a zone. Keep it in the detail payload instead.
+    if restriction_type == "zone" and not zone:
+        return False
     if location and locations and location.lower().replace(" ", "") not in locations:
         return False
     if zone and zones and zone.lower() not in zones:
@@ -185,6 +210,7 @@ def parse_resource_sku(sku: Any, location: Optional[str] = None,
         "restricted": bool(applicable_restrictions),
         "selectable": not bool(applicable_restrictions),
         "restriction_applies_to_current_location": bool(applicable_restrictions),
+        "trusted_launch_supported": supports_trusted_launch({"capabilities": capabilities}),
         "locations": list(_get(sku, "locations", default=[]) or []),
         "location_info": _location_info(_get(sku, "location_info", "locationInfo", default=[])),
     }
@@ -222,6 +248,7 @@ def filter_resize_candidates(
     catalog_by_name: Mapping[str, Mapping[str, Any]],
     current_nic_accelerated: Optional[bool] = None,
     current_billing_mode: str = "on_demand",
+    current_trusted_launch: bool = False,
 ) -> list[dict[str, Any]]:
     current_architecture = normalize_architecture(current_architecture)
     if not current_architecture:
@@ -246,6 +273,20 @@ def filter_resize_candidates(
         merged["restricted"] = bool(catalog.get("restricted"))
         merged["selectable"] = not merged["restricted"]
         merged.setdefault("restriction_reasons", [])
+
+        trusted_launch_support = supports_trusted_launch(catalog)
+        if current_trusted_launch and trusted_launch_support is not True:
+            merged["restricted"] = True
+            merged["selectable"] = False
+            reasons = list(merged.get("restriction_reasons") or [])
+            reason_code = (
+                "TrustedLaunchUnsupported"
+                if trusted_launch_support is False
+                else "TrustedLaunchSupportUnknown"
+            )
+            if reason_code not in reasons:
+                reasons.append(reason_code)
+            merged["restriction_reasons"] = reasons
 
         # 调整规格只更新硬件规格，不能同时修改 VM 的 Spot 或网卡状态。
         # 因此不应列出无法继承当前运行状态的可选规格；受限规格仍保留用于展示。
@@ -337,6 +378,10 @@ def is_retail_price_compatible(
     product_name = str(
         _price_value(record, "productName", "product_name", default="")
     ).strip().lower()
+    # Retail Prices 将旧版 Cloud Services 计价项也归在 serviceName=Virtual Machines
+    # 下；它们不是 ARM VM 的计算价格，必须在 serviceName 判断之后再次排除。
+    if "cloud services" in product_name:
+        return False
     service_name = str(
         _price_value(record, "serviceName", "service_name", default="")
     ).strip().lower()
