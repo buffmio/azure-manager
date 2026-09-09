@@ -30,7 +30,7 @@ Azure Manager 是一个自托管的 Microsoft Azure 多订阅运维管理面板�
   -> /app/data/database.db
 ```
 
-默认 Docker 启动命令使用 1 个 Gunicorn Worker、2 个线程，适配 2C1G 主机并避免 SQLite 多进程写入竞争。SQLite 使用 WAL 模式，因此应用运行时必须将数据库文件及其 WAL 伴随文件保存在持久化存储中。
+默认 Docker 启动命令使用 1 个 Gunicorn Worker、2 个 Web 线程；应用内 Azure 任务执行器默认使用 2 个线程，使不同 VM 的操作可以并行，同时由同一 VM 的任务预留机制保持串行。为避免长时间 Azure 任务被 Worker 生命周期中断，Gunicorn 不启用按请求自动回收。SQLite 使用 WAL 模式，因此应用运行时必须将数据库文件及其 WAL 伴随文件保存在持久化存储中。
 
 ## 环境要求
 
@@ -182,6 +182,8 @@ az ad sp create-for-rbac --name azure-manager-sp --role Contributor --scopes /su
 - Availability Set、VMSS 和 Dedicated Host 中的 VM 暂不支持自动升降配。
 
 升降配作为后台任务执行，进度和结果可在页面任务提示及“活动日志”中查看。同一台 VM 已有其他操作时会复用原任务，避免重复调用 Azure。Azure 操作失败时，任务会标记为失败并尽力回读实际规格和电源状态，不会用未确认的目标状态覆盖本地缓存。
+
+开机、关机释放、重启和销毁等 VM 生命周期操作也会在活动通知中报告准备、下发 Azure 指令、等待 Azure 完成和状态确认等阶段。不同 VM 的生命周期操作可以并行执行；同一 VM 的重复操作仍会复用现有任务。
 
 调整规格前请确认能够接受停机、临时磁盘数据丢失和动态公网 IP 变化风险，并确认目标规格在该区域和订阅中仍有容量及配额。
 

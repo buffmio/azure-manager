@@ -50,6 +50,16 @@ def wait_for_azure_poller(poller):
     return poller.wait(timeout=AZURE_OPERATION_TIMEOUT_SECONDS)
 
 
+def report_operation_progress(progress_callback, message: str) -> None:
+    """向持久化任务报告生命周期进度；通知失败不能影响 Azure 操作本身。"""
+    if not progress_callback:
+        return
+    try:
+        progress_callback(message)
+    except Exception:
+        logger.exception("写入 Azure 操作进度失败：%s", message)
+
+
 # 官方主流系统镜像元数据定义 (严格标注架构支持，绝不进行虚假跨架构重定向)
 PRESET_IMAGES = {
     "Ubuntu_24_04_LTS": {
@@ -1117,34 +1127,50 @@ class AzureService:
             )
 
     @classmethod
-    def start_vm(cls, tenant_id: str, client_id: str, client_secret: str, subscription_id: str, resource_group: str, vm_name: str):
+    def start_vm(cls, tenant_id: str, client_id: str, client_secret: str, subscription_id: str, resource_group: str, vm_name: str, progress_callback=None):
+        report_operation_progress(progress_callback, "正在准备 Azure 开机操作...")
         cred = cls.get_credential(tenant_id, client_id, client_secret)
         compute_client = ComputeManagementClient(cred, subscription_id)
+        report_operation_progress(progress_callback, "正在向 Azure 下发开机指令...")
         poller = compute_client.virtual_machines.begin_start(resource_group, vm_name)
+        report_operation_progress(progress_callback, "Azure 正在执行开机操作...")
         wait_for_azure_poller(poller)
+        report_operation_progress(progress_callback, "Azure 开机操作已完成，正在确认状态...")
 
     @classmethod
-    def stop_vm(cls, tenant_id: str, client_id: str, client_secret: str, subscription_id: str, resource_group: str, vm_name: str):
+    def stop_vm(cls, tenant_id: str, client_id: str, client_secret: str, subscription_id: str, resource_group: str, vm_name: str, progress_callback=None):
         """停止并解除分配 (释放计费)"""
+        report_operation_progress(progress_callback, "正在准备 Azure 关机释放操作...")
         cred = cls.get_credential(tenant_id, client_id, client_secret)
         compute_client = ComputeManagementClient(cred, subscription_id)
+        report_operation_progress(progress_callback, "正在向 Azure 下发关机释放指令...")
         poller = compute_client.virtual_machines.begin_deallocate(resource_group, vm_name)
+        report_operation_progress(progress_callback, "Azure 正在执行关机释放操作...")
         wait_for_azure_poller(poller)
+        report_operation_progress(progress_callback, "Azure 关机释放操作已完成，正在确认状态...")
 
     @classmethod
-    def restart_vm(cls, tenant_id: str, client_id: str, client_secret: str, subscription_id: str, resource_group: str, vm_name: str):
+    def restart_vm(cls, tenant_id: str, client_id: str, client_secret: str, subscription_id: str, resource_group: str, vm_name: str, progress_callback=None):
+        report_operation_progress(progress_callback, "正在准备 Azure 重启操作...")
         cred = cls.get_credential(tenant_id, client_id, client_secret)
         compute_client = ComputeManagementClient(cred, subscription_id)
+        report_operation_progress(progress_callback, "正在向 Azure 下发重启指令...")
         poller = compute_client.virtual_machines.begin_restart(resource_group, vm_name)
+        report_operation_progress(progress_callback, "Azure 正在执行重启操作...")
         wait_for_azure_poller(poller)
+        report_operation_progress(progress_callback, "Azure 重启操作已完成，正在确认状态...")
 
     @classmethod
-    def delete_vm_and_resources(cls, tenant_id: str, client_id: str, client_secret: str, subscription_id: str, resource_group: str, vm_name: str):
+    def delete_vm_and_resources(cls, tenant_id: str, client_id: str, client_secret: str, subscription_id: str, resource_group: str, vm_name: str, progress_callback=None):
         """删除资源组（完整销毁关联的 VM/网卡/IP/磁盘）"""
+        report_operation_progress(progress_callback, "正在准备 Azure 销毁操作...")
         cred = cls.get_credential(tenant_id, client_id, client_secret)
         resource_client = ResourceManagementClient(cred, subscription_id)
+        report_operation_progress(progress_callback, "正在向 Azure 下发资源组删除指令...")
         poller = resource_client.resource_groups.begin_delete(resource_group)
+        report_operation_progress(progress_callback, "Azure 正在删除虚拟机及其关联资源...")
         wait_for_azure_poller(poller)
+        report_operation_progress(progress_callback, "Azure 资源删除操作已完成，正在刷新列表...")
 
     # ========================== 创建虚拟机 ==========================
 

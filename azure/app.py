@@ -397,9 +397,9 @@ def add_security_headers(response):
     return response
 
 
-AZURE_TASK_WORKERS_DEFAULT = 1
+AZURE_TASK_WORKERS_DEFAULT = 2
 AZURE_TASK_WORKERS_MIN = 1
-AZURE_TASK_WORKERS_MAX = 2
+AZURE_TASK_WORKERS_MAX = 8
 
 
 def resolve_azure_task_workers(raw_value=None) -> int:
@@ -2811,7 +2811,21 @@ def vm_action(sub_id, resource_group, vm_name, action_type):
     def async_do():
         with app.app_context():
             try:
-                action_func(tenant_id, client_id, client_secret, sub_azure_id, resource_group, vm_name)
+                def update_action_progress(message):
+                    try:
+                        task = db.session.get(DeploymentTask, task_id)
+                        if task and task.status in ("Pending", "InProgress"):
+                            task.progress_msg = message
+                            db.session.commit()
+                    except Exception:
+                        db.session.rollback()
+                        logger.exception("写入虚拟机操作进度失败：task_id=%s", task_id)
+
+                action_func(
+                    tenant_id, client_id, client_secret, sub_azure_id,
+                    resource_group, vm_name,
+                    progress_callback=update_action_progress,
+                )
                 # 只有当 Azure 彻底执行成功后，才更新/删除本地 VmCache 和内存缓存
                 if action_type == "delete":
                     VmCache.query.filter_by(subscription_id=sub_pk, name=vm_name).delete()

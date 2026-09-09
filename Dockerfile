@@ -29,4 +29,4 @@ EXPOSE 8888
 USER azuremanager
 
 # 2C1G：单 Worker 共享 SQLite 和连接缓存，少量线程处理 Azure I/O 等待。
-CMD ["gunicorn", "-w", "1", "--threads", "2", "-b", "0.0.0.0:8888", "--max-requests", "1000", "--max-requests-jitter", "50", "--chdir", "/app/azure", "app:app"]
+CMD ["gunicorn", "-w", "1", "--threads", "2", "-b", "0.0.0.0:8888", "--chdir", "/app/azure", "app:app"]
