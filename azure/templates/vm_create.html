@@ -80,6 +80,22 @@
                     </div>
                 </div>
                 <div class="azure-form-row">
+                    <label class="azure-form-label" for="architecture-custom-dropdown">处理器架构 <span class="field-hint">Architecture</span></label>
+                    <div class="azure-form-control">
+                        <input type="hidden" name="architecture" id="architecture-input-hidden" value="x64" required>
+                        <div class="custom-dropdown-container" id="architecture-custom-dropdown">
+                            <div class="custom-dropdown-btn" onclick="toggleCustomDropdown('architecture-custom-dropdown', event)">
+                                <span id="architecture-dropdown-label">正在读取可用架构...</span>
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10l5 5 5-5z"/></svg>
+                            </div>
+                            <div class="custom-dropdown-menu" id="architecture-dropdown-menu">
+                                <div class="custom-dropdown-item disabled">正在读取可用架构...</div>
+                            </div>
+                        </div>
+                        <div class="azure-form-help">先选择 x64 或 ARM64，后续只显示匹配架构的规格和镜像。</div>
+                    </div>
+                </div>
+                <div class="azure-form-row">
                     <label class="azure-form-label" for="image-custom-dropdown">系统镜像 <span class="field-hint">Azure 官方发行版</span></label>
                     <div class="azure-form-control">
                         <input type="hidden" name="image" id="image-input-hidden" value="">
@@ -144,7 +160,7 @@
                         <div class="azure-form-inline-grid">
                             <div>
                                 <label class="sr-only" for="create-password-input">登录密码</label>
-                                <input type="password" name="admin_password" id="create-password-input" class="form-control" placeholder="至少 12 位，包含三类字符" required autocomplete="new-password">
+                                <input type="password" name="admin_password" id="create-password-input" class="form-control" placeholder="至少 12 位，包含三类字符" minlength="12" required autocomplete="new-password">
                             </div>
                             <div>
                                 <label class="sr-only" for="create-password-confirm">确认登录密码</label>
@@ -228,6 +244,11 @@ document.getElementById('create-vm-form').addEventListener('submit', function(e)
     if (authType === 'password') {
         const pwd = document.getElementById('create-password-input').value;
         const confirmPwd = document.getElementById('create-password-confirm').value;
+        if (!meetsCreatePasswordPolicy(pwd)) {
+            showTopAlert('密码至少 12 位，并至少包含大写字母、小写字母、数字和非空白特殊字符中的三类。', 'danger');
+            document.getElementById('create-password-input').focus();
+            return;
+        }
         if (pwd !== confirmPwd) {
             showTopAlert('两次输入的登录密码不一致，请仔细核对后重新输入！', 'danger');
             document.getElementById('create-password-confirm').focus();
@@ -246,7 +267,6 @@ document.getElementById('create-vm-form').addEventListener('submit', function(e)
     const btn = document.getElementById('btn-submit-create-vm');
     if (btn) {
         setButtonBusy(btn, true, "正在向 Azure 下发部署指令...", null);
-        showTopAlert("已开始创建虚拟机，进度可在活动通知查看。", "info");
     }
     const formData = new FormData(this);
     fetch(this.action || window.location.href, {
@@ -259,6 +279,7 @@ document.getElementById('create-vm-form').addEventListener('submit', function(e)
         if (!ok || data.status !== 'submitted' || !data.first_task_id) {
             throw new Error(data.message || '创建任务提交失败');
         }
+        showTopAlert("已开始创建虚拟机，进度可在活动通知查看。", "info");
         startWatchingTask(data.target_name || '新建虚拟机', 'create', data.first_task_id);
         setTimeout(() => {
             window.location.href = "{{ url_for('vms_page', sub_id=subscription.id) }}";
@@ -270,6 +291,18 @@ document.getElementById('create-vm-form').addEventListener('submit', function(e)
         showTopAlert("创建请求失败：" + (err.message || "网络连接异常，请确认活动通知后再重试"), "danger");
     });
 });
+
+function meetsCreatePasswordPolicy(password) {
+    const characters = Array.from(password || '');
+    if (characters.length < 12) return false;
+    const characterClasses = [
+        characters.some(char => /\p{Ll}/u.test(char)),
+        characters.some(char => /\p{Lu}/u.test(char)),
+        characters.some(char => /\p{N}/u.test(char)),
+        characters.some(char => !/[\p{L}\p{N}\s]/u.test(char)),
+    ];
+    return characterClasses.filter(Boolean).length >= 3;
+}
 
 function toggleAuthType(val) {
     const pwdBox = document.getElementById('auth-password-box');
@@ -298,6 +331,7 @@ function toggleCustomImage(val) {
 }
 
 let dynamicImagesData = { x64: [], arm64: [] };
+let skuCatalogData = [];
 let skuArchitectureByName = Object.create(null);
 let skuDataByName = Object.create(null);
 let skuPriceCache = Object.create(null);
@@ -310,6 +344,64 @@ let dynamicImagesReady = false;
 
 function getSkuArchitecture(sizeName) {
     return skuArchitectureByName[sizeName] || '';
+}
+
+function getSelectedArchitecture() {
+    return document.getElementById('architecture-input-hidden')?.value || 'x64';
+}
+
+function architectureLabel(architecture) {
+    return architecture === 'arm64' ? 'ARM64（Ampere）' : 'x64（Intel/AMD）';
+}
+
+function selectArchitectureOption(architecture, label) {
+    const hiddenInput = document.getElementById('architecture-input-hidden');
+    const labelSpan = document.getElementById('architecture-dropdown-label');
+    const dropdown = document.getElementById('architecture-custom-dropdown');
+    const normalized = String(architecture || '').toLowerCase();
+    if (!['x64', 'arm64'].includes(normalized)) return;
+    if (hiddenInput) hiddenInput.value = normalized;
+    if (labelSpan) labelSpan.textContent = label || architectureLabel(normalized);
+    if (dropdown) {
+        dropdown.classList.remove('open');
+        dropdown.querySelectorAll('.custom-dropdown-item').forEach(item => {
+            item.classList.toggle('selected', item.dataset.architecture === normalized);
+        });
+    }
+    handleArchitectureChange(normalized);
+}
+
+function renderArchitectureOptions(skus, requestSequence) {
+    if (requestSequence !== locationRequestSequence) return;
+    const menu = document.getElementById('architecture-dropdown-menu');
+    const labelSpan = document.getElementById('architecture-dropdown-label');
+    const hiddenInput = document.getElementById('architecture-input-hidden');
+    if (!menu || !labelSpan || !hiddenInput) return;
+
+    const available = new Set((skus || []).map(sku => sku.architecture).filter(architecture => ['x64', 'arm64'].includes(architecture)));
+    menu.innerHTML = '';
+    ['x64', 'arm64'].forEach(architecture => {
+        const item = document.createElement('div');
+        const supported = available.has(architecture);
+        item.className = `custom-dropdown-item ${supported ? '' : 'disabled'}`;
+        item.dataset.architecture = architecture;
+        item.textContent = architectureLabel(architecture) + (supported ? '' : '（当前地域不可用）');
+        item.title = supported ? '' : '当前订阅和地域没有探测到该架构的可用规格';
+        if (supported) {
+            item.onclick = event => {
+                event.stopPropagation();
+                selectArchitectureOption(architecture, architectureLabel(architecture));
+            };
+        }
+        menu.appendChild(item);
+    });
+
+    const current = available.has(hiddenInput.value) ? hiddenInput.value : (available.has('x64') ? 'x64' : 'arm64');
+    hiddenInput.value = current;
+    labelSpan.textContent = architectureLabel(current);
+    menu.querySelectorAll('.custom-dropdown-item').forEach(item => {
+        item.classList.toggle('selected', item.dataset.architecture === current);
+    });
 }
 
 
@@ -852,6 +944,24 @@ function selectSkuOption(skuName, displayLabel, isArm) {
     renderImagesForCurrentSku();
 }
 
+function renderArchitectureEmptyState(requestSequence) {
+    if (requestSequence !== locationRequestSequence) return;
+    const menu = document.getElementById('sku-dropdown-menu');
+    const loadingText = document.getElementById('sku-loading');
+    const hiddenInput = document.getElementById('sku-input-hidden');
+    const labelSpan = document.getElementById('sku-dropdown-label');
+    const architecture = getSelectedArchitecture();
+    if (loadingText) loadingText.style.display = 'none';
+    setSkuPriceLoading(false);
+    if (hiddenInput) hiddenInput.value = '';
+    if (labelSpan) labelSpan.textContent = `当前地域暂无 ${architectureLabel(architecture)} 规格`;
+    if (menu) {
+        menu.innerHTML = `<div class="custom-dropdown-item disabled">当前地域暂无 ${architectureLabel(architecture)} 规格</div>`;
+        menu.style.visibility = 'visible';
+    }
+    renderImagesForCurrentSku();
+}
+
 function renderUnavailableSkuState(data, requestSequence) {
     if (requestSequence !== locationRequestSequence) return;
     const menu = document.getElementById('sku-dropdown-menu');
@@ -893,25 +1003,26 @@ function isSelectableSku(sku) {
         && reasons.length === 0;
 }
 
-function renderSkusForLocation(data, location, requestSequence) {
+function renderSkusForLocation(data, location, requestSequence, preserveCatalog = false) {
     const menu = document.getElementById('sku-dropdown-menu');
     const loadingText = document.getElementById('sku-loading');
     const hiddenInput = document.getElementById('sku-input-hidden');
     const labelSpan = document.getElementById('sku-dropdown-label');
     if (requestSequence !== locationRequestSequence) return;
+    if (!preserveCatalog) {
+        skuCatalogData = Array.isArray(data?.skus) ? data.skus : [];
+    }
     if (data?.status === 'unavailable') {
         renderUnavailableSkuState(data, requestSequence);
         return;
     }
-    const skus = Array.isArray(data.skus) ? data.skus : [];
+    const skus = skuCatalogData.filter(sku => sku.architecture === getSelectedArchitecture());
+    if (skuCatalogData.length > 0 && skus.length === 0) {
+        renderArchitectureEmptyState(requestSequence);
+        return;
+    }
     if (skus.length > 0 && !skus.some(isSelectableSku)) {
-        renderUnavailableSkuState({
-            status: 'unavailable',
-            availability: 'subscription',
-            reason_code: 'NotAvailableForSubscription',
-            message: '当前订阅在该地域没有可用虚拟机规格',
-            skus: [],
-        }, requestSequence);
+        renderArchitectureEmptyState(requestSequence);
         return;
     }
     if (skus.length > 0) {
@@ -923,7 +1034,7 @@ function renderSkusForLocation(data, location, requestSequence) {
         // 分类组定义 (按系列向下展开，分类清晰规范)
         const groupDefinitions = [
             { id: 'recommend', label: '常用推荐 (Recommended)', match: s => ['Standard_B1s', 'Standard_B1ms', 'Standard_B2s', 'Standard_B2ms', 'Standard_B2ats_v2', 'Standard_D2s_v3', 'Standard_D2s_v5'].includes(s.name) },
-            { id: 'arm', label: 'ARM64 架构实例 (Ampere / 需 ARM 镜像)', match: s => getSkuArchitecture(s.name) === 'arm64' },
+            { id: 'arm', label: 'ARM64 系列 (Ampere / 需 ARM 镜像)', match: s => getSkuArchitecture(s.name) === 'arm64' },
             { id: 'b_series', label: 'B 系列 - 突发性能 (高性价比)', match: s => s.name.startsWith('Standard_B') && getSkuArchitecture(s.name) !== 'arm64' },
             { id: 'd_series', label: 'D 系列 - 通用计算型', match: s => (s.name.startsWith('Standard_D') || s.name.startsWith('Standard_DC')) && getSkuArchitecture(s.name) !== 'arm64' },
             { id: 'e_series', label: 'E 系列 - 内存优化型', match: s => (s.name.startsWith('Standard_E') || s.name.startsWith('Standard_EC')) && getSkuArchitecture(s.name) !== 'arm64' },
@@ -1059,6 +1170,8 @@ function loadSkusForLocation(location, requestSequence) {
     loadingText.style.display = 'inline';
     const browserCachedSkus = readSkuBrowserCache(location);
     if (browserCachedSkus) {
+        skuCatalogData = browserCachedSkus;
+        renderArchitectureOptions(skuCatalogData, requestSequence);
         renderSkusForLocation({ skus: browserCachedSkus }, location, requestSequence);
         return;
     }
@@ -1074,6 +1187,8 @@ function loadSkusForLocation(location, requestSequence) {
                 throw new Error(data.message || '规格加载失败');
             }
             if (data.skus && data.skus.length > 0) writeSkuBrowserCache(location, data.skus);
+            skuCatalogData = Array.isArray(data.skus) ? data.skus : [];
+            renderArchitectureOptions(skuCatalogData, requestSequence);
             renderSkusForLocation(data, location, requestSequence);
         })
         .catch(err => {
@@ -1099,7 +1214,7 @@ function renderImagesForCurrentSku() {
     const imageMenu = document.getElementById('image-dropdown-menu');
 
     const selectedSku = hiddenSku ? hiddenSku.value : '';
-    const isArm = getSkuArchitecture(selectedSku) === 'arm64';
+    const isArm = getSelectedArchitecture() === 'arm64';
     const imgList = (isArm ? dynamicImagesData.arm64 : dynamicImagesData.x64).filter(img => img.urn);
 
     if (!imageMenu) return;
@@ -1193,6 +1308,23 @@ function renderImagesForCurrentSku() {
     }
 }
 
+function handleArchitectureChange(architecture) {
+    const requestSequence = locationRequestSequence;
+    const hiddenSku = document.getElementById('sku-input-hidden');
+    const hiddenImage = document.getElementById('image-input-hidden');
+    const skuLabel = document.getElementById('sku-dropdown-label');
+    const imageLabel = document.getElementById('image-dropdown-label');
+    imageSelectionRequired = false;
+    if (hiddenSku) hiddenSku.value = '';
+    if (hiddenImage) hiddenImage.value = '';
+    if (skuLabel) skuLabel.textContent = '正在加载匹配架构的规格...';
+    if (imageLabel) imageLabel.textContent = '正在读取匹配架构的镜像...';
+    if (skuCatalogData.length > 0) {
+        renderSkusForLocation({ skus: skuCatalogData }, document.getElementById('location-input-hidden')?.value || '', requestSequence, true);
+    }
+    renderImagesForCurrentSku();
+}
+
 function handleLocationChange(loc) {
     const requestSequence = ++locationRequestSequence;
     cancelStaleSkuPriceRequests(loc);
@@ -1201,10 +1333,14 @@ function handleLocationChange(loc) {
         skuPricePrewarmTimer = null;
     }
     dynamicImagesData = { x64: [], arm64: [] };
+    skuCatalogData = [];
     dynamicImagesReady = false;
     setSkuPriceLoading(false);
     document.getElementById('sku-input-hidden').value = '';
     document.getElementById('image-input-hidden').value = '';
+    document.getElementById('architecture-input-hidden').value = 'x64';
+    document.getElementById('architecture-dropdown-label').textContent = '正在读取可用架构...';
+    document.getElementById('architecture-dropdown-menu').innerHTML = '<div class="custom-dropdown-item disabled">正在读取可用架构...</div>';
     const skuMenu = document.getElementById('sku-dropdown-menu');
     const imageMenu = document.getElementById('image-dropdown-menu');
     if (skuMenu) {

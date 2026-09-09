@@ -1809,6 +1809,7 @@ def create_vm_page():
         admin_password_confirm = request.form.get("admin_password_confirm", "").strip()
         ssh_public_key = request.form.get("ssh_public_key", "").strip()
         auth_type = request.form.get("auth_type", "password").strip()
+        requested_architecture = request.form.get("architecture", "").strip().lower()
         disk_size_raw = request.form.get("disk_size_gb", 30)
 
         # 安全读取 CustomData：优先从选择的 script_id 加密模板解密注入，绝不在前端暴露明文
@@ -1829,6 +1830,9 @@ def create_vm_page():
         except ValueError as exc:
             return reject(str(exc))
 
+        if requested_architecture not in {"x64", "arm64"}:
+            return reject("必须选择有效的处理器架构")
+
         accelerated_networking = (request.form.get("accelerated_networking") == "true")
         spot_instance = (request.form.get("spot_instance") == "true")
 
@@ -1848,6 +1852,8 @@ def create_vm_page():
             return reject("所选虚拟机规格当前受限，无法创建")
         if not selected_sku.architecture:
             return reject("所选规格缺少 Azure 架构信息，请重新加载规格列表")
+        if selected_sku.architecture != requested_architecture:
+            return reject("所选规格与处理器架构不匹配，请重新选择")
         if spot_instance and selected_sku.spot_capable is not True:
             return reject("所选规格或当前订阅不支持 Spot 抢占式计费")
         if accelerated_networking and selected_sku.accelerated_networking_supported is not True:
