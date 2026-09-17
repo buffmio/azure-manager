@@ -224,7 +224,7 @@
     }
 
     function enhanceSelect(select) {
-        if (!(select instanceof window.HTMLSelectElement) || !select.classList.contains('form-control') || select.hasAttribute('data-custom-dropdown') || nativeControls.has(select)) return;
+        if (!(select instanceof window.HTMLSelectElement) || !select.classList.contains('form-control') || select.hasAttribute('data-custom-dropdown') || select.hasAttribute('data-native-dropdown') || nativeControls.has(select)) return;
         const id = ensureSelectId(select);
         const container = document.createElement('div');
         container.className = 'ui-native-dropdown';

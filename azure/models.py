@@ -164,6 +164,11 @@ class DeploymentTask(db.Model):
     status = db.Column(db.String(32), default='Pending')  # Pending, InProgress, Succeeded, Failed
     progress_msg = db.Column(db.String(256), default='任务已提交，准备执行')
     error_detail = db.Column(db.Text, nullable=True)
+    error_code = db.Column(db.String(128), nullable=True)
+    error_category = db.Column(db.String(64), nullable=True)
+    retryable = db.Column(db.Boolean, nullable=True)
+    request_id = db.Column(db.String(256), nullable=True)
+    provider_operation_id = db.Column(db.String(512), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

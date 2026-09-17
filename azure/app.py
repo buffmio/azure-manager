@@ -24,6 +24,7 @@ import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.exceptions import HTTPException
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 import click
 from hmac import compare_digest
@@ -52,7 +53,7 @@ MAX_FIREWALL_PORT_RANGE_LENGTH = 128
 VM_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 ADMIN_USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 FIREWALL_RULE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
-ALLOWED_FIREWALL_PROTOCOLS = {"Tcp", "Udp", "*"}
+ALLOWED_FIREWALL_PROTOCOLS = {"Tcp", "Udp", "Icmp", "*"}
 ALLOWED_FIREWALL_ACCESS = {"Allow", "Deny"}
 ALLOWED_FIREWALL_DIRECTIONS = {"Inbound", "Outbound"}
 ALLOWED_SERVICE_TAGS = {"*", "Internet", "VirtualNetwork", "AzureLoadBalancer"}
@@ -60,9 +61,92 @@ RETAIL_PRICE_CACHE_SOURCE = "azure_retail_prices_v3"
 SKU_CATALOG_CACHE_HOURS = 1
 
 
-def public_error_message(operation="Azure 操作"):
-    """给客户端返回固定的安全错误文本，详细异常只进入服务端日志。"""
-    return f"{operation}失败，请查看活动日志或稍后重试。"
+ERROR_CODE_MESSAGES = {
+    "AllocationFailed": ("capacity", "该区域当前没有足够的虚拟机容量，请更换规格或区域后重试。", True),
+    "AuthorizationFailed": ("permission", "当前订阅或凭据没有执行此操作的权限，请检查 Azure 角色授权。", False),
+    "Forbidden": ("permission", "当前订阅或凭据没有执行此操作的权限，请检查 Azure 角色授权。", False),
+    "QuotaExceeded": ("quota", "当前订阅的资源配额不足，请申请配额或更换规格/区域。", False),
+    "OperationNotAllowed": ("permission", "当前订阅或区域不允许执行此操作。", False),
+    "ResourceNotFound": ("not_found", "目标 Azure 资源不存在或已被删除。", False),
+    "NotFound": ("not_found", "目标 Azure 资源不存在或已被删除。", False),
+    "Conflict": ("conflict", "资源当前状态不允许执行此操作，请刷新状态后重试。", True),
+    "InvalidParameter": ("validation", "请求参数不符合 Azure 要求，请检查输入内容。", False),
+    "InvalidRequest": ("validation", "请求参数不符合 Azure 要求，请检查输入内容。", False),
+    "TooManyRequests": ("rate_limit", "Azure 接口暂时限流，请稍后重试。", True),
+    "RequestRateTooLarge": ("rate_limit", "Azure 接口暂时限流，请稍后重试。", True),
+    "ResourceGroupNotFound": ("not_found", "目标资源组不存在或已被删除。", False),
+}
+
+
+def _azure_error_text(error):
+    candidates = [
+        getattr(getattr(error, "error", None), "message", None),
+        getattr(error, "message", None),
+        str(error or ""),
+    ]
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text:
+            text = re.sub(r"(?i)(client_secret|clientsecret|password|token)=([^,; ]+)", r"\1=[已隐藏]", text)
+            return text.splitlines()[0][:320]
+    return "未返回详细错误信息"
+
+
+def _azure_error_request_id(error):
+    for value in (
+        getattr(error, "request_id", None),
+        getattr(error, "x_ms_request_id", None),
+        getattr(getattr(error, "response", None), "headers", {}).get("x-ms-request-id") if getattr(error, "response", None) else None,
+        getattr(getattr(error, "response", None), "headers", {}).get("x-ms-correlation-request-id") if getattr(error, "response", None) else None,
+    ):
+        if value:
+            return str(value)
+    return None
+
+
+def describe_azure_error(error, operation="Azure 操作"):
+    """把 Azure/网络异常转换成可展示但不泄露凭据的诊断信息。"""
+    code = _azure_error_code(error) or "AzureError"
+    text = _azure_error_text(error)
+    status_code = getattr(error, "status_code", None)
+    category, message, retryable = ERROR_CODE_MESSAGES.get(code, (None, None, None))
+    lowered = text.lower()
+    if not category and (status_code == 429 or "too many requests" in lowered or "rate limit" in lowered):
+        code, category, message, retryable = code if code != "AzureError" else "TooManyRequests", "rate_limit", "Azure 接口暂时限流，请稍后重试。", True
+    elif not category and ("timeout" in lowered or "timed out" in lowered):
+        code, category, message, retryable = "Timeout", "timeout", "Azure 请求超时，请稍后查看任务状态或重试。", True
+    elif not category and ("allocation" in lowered and "capacity" in lowered):
+        code, category, message, retryable = "AllocationFailed", "capacity", "该区域当前没有足够的虚拟机容量，请更换规格或区域后重试。", True
+    elif not category:
+        category, message, retryable = "provider", text, False
+    request_id = _azure_error_request_id(error)
+    detail = f"{operation}失败：{message}"
+    if request_id:
+        detail += f"（Request ID: {request_id}）"
+    return {
+        "code": code,
+        "category": category,
+        "message": detail,
+        "retryable": bool(retryable),
+        "request_id": request_id,
+        "provider_operation_id": getattr(error, "operation_id", None),
+    }
+
+
+def public_error_message(operation="Azure 操作", error=None):
+    """返回可展示的具体错误；未提供异常时保留通用兜底文案。"""
+    return describe_azure_error(error, operation)["message"] if error else f"{operation}失败，请查看活动日志或稍后重试。"
+
+
+def set_task_error(task, error, operation="Azure 操作"):
+    detail = describe_azure_error(error, operation)
+    task.error_detail = detail["message"]
+    task.error_code = detail["code"]
+    task.error_category = detail["category"]
+    task.retryable = detail["retryable"]
+    task.request_id = detail["request_id"]
+    task.provider_operation_id = detail["provider_operation_id"]
+    return detail
 
 
 def is_ajax_request():
@@ -243,6 +327,21 @@ def validate_firewall_rule(rule_name, priority, protocol, port_range, source_cid
 
 
 app = Flask(__name__)
+
+
+@app.errorhandler(HTTPException)
+def handle_http_error(error):
+    if request.path.startswith("/api/"):
+        return jsonify({"status": "error", "message": error.description or "请求失败"}), error.code
+    return error
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    logger.exception("未处理的请求异常：%s", request.path)
+    if request.path.startswith("/api/"):
+        return jsonify({"status": "error", "message": public_error_message("接口请求", error)}), 500
+    return render_template("500.html"), 500
 
 
 def resolve_trust_proxy_hops(raw_value=None):
@@ -458,7 +557,7 @@ def _mark_background_task_failed(task_id, error: Exception) -> None:
         if task and task.status in ("Pending", "InProgress"):
             task.status = "Failed"
             task.progress_msg = "后台任务执行失败"
-            task.error_detail = public_error_message()
+            set_task_error(task, error, "后台任务执行")
             db.session.commit()
     except Exception:
         db.session.rollback()
@@ -474,7 +573,7 @@ def _mark_background_task_submission_failed(task_id, error: Exception) -> None:
         if task and task.status in ("Pending", "InProgress"):
             task.status = "Failed"
             task.progress_msg = "后台任务提交失败"
-            task.error_detail = public_error_message("后台任务提交")
+            set_task_error(task, error, "后台任务提交")
             db.session.commit()
     except Exception:
         db.session.rollback()
@@ -726,6 +825,16 @@ def ensure_deployment_task_schema(connection=None):
         if "rule_name" not in columns:
             connection.execute(text("ALTER TABLE deployment_tasks ADD COLUMN rule_name VARCHAR(128)"))
             columns["rule_name"] = {"name": "rule_name"}
+        for column_name, column_type in {
+            "error_code": "VARCHAR(128)",
+            "error_category": "VARCHAR(64)",
+            "retryable": "BOOLEAN",
+            "request_id": "VARCHAR(256)",
+            "provider_operation_id": "VARCHAR(512)",
+        }.items():
+            if column_name not in columns:
+                connection.execute(text(f"ALTER TABLE deployment_tasks ADD COLUMN {column_name} {column_type}"))
+                columns[column_name] = {"name": column_name}
         subscription_column = columns.get("subscription_id")
         if not subscription_column or subscription_column.get("nullable", True):
             if owns_connection:
@@ -1326,7 +1435,7 @@ login_manager.login_message_category = "warning"
 
 @login_manager.unauthorized_handler
 def handle_unauthorized_request():
-    if is_ajax_request():
+    if is_ajax_request() or request.path.startswith("/api/"):
         return jsonify({"status": "error", "message": "登录已过期，请重新登录"}), 401
     return redirect(url_for("login", next=request.url))
 
@@ -1712,7 +1821,7 @@ def api_sub_vms_data():
                         "account_name": params["account_name"]
                     })
                 return {"sub_id": params["sub_id"], "vms": cached_vms,
-                        "error": public_error_message("虚拟机列表同步")}
+                        "error": public_error_message("虚拟机列表同步", exc)}
 
     def execute_vm_sync(task_id=None):
         import concurrent.futures
@@ -1753,7 +1862,7 @@ def api_sub_vms_data():
                 if task and task.status in ("Pending", "InProgress"):
                     task.status = "Failed"
                     task.progress_msg = "虚拟机列表同步失败"
-                    task.error_detail = public_error_message()
+                    set_task_error(task, exc, "虚拟机列表同步")
                     db.session.commit()
 
     if force_refresh:
@@ -1919,6 +2028,7 @@ def create_vm_page():
                     # Azure 创建成功后，先同步 VmCache，再把任务标记为完成。
                     # 否则前端收到成功状态后立即刷新，可能早于新 VM 写入列表缓存。
                     cache_sync_error = None
+                    cache_sync_exception = None
                     try:
                         t = db.session.get(DeploymentTask, task_id)
                         if t:
@@ -1951,7 +2061,8 @@ def create_vm_page():
                         AzureService._vm_cache.pop(f"vms_{subscription_azure_id}", None)
                     except Exception as cache_err:
                         db.session.rollback()
-                        cache_sync_error = public_error_message("虚拟机列表缓存同步")
+                        cache_sync_exception = cache_err
+                        cache_sync_error = public_error_message("虚拟机列表缓存同步", cache_err)
                         logger.warning(f"Failed to auto-update VmCache after deploy: {cache_err}")
 
                     t = db.session.get(DeploymentTask, task_id)
@@ -1959,17 +2070,18 @@ def create_vm_page():
                         t.status = "Succeeded"
                         t.progress_msg = "创建成功并已开机" if not cache_sync_error else "创建成功，但列表缓存同步失败，请刷新列表"
                         t.error_detail = cache_sync_error
+                        if cache_sync_exception:
+                            set_task_error(t, cache_sync_exception, "虚拟机列表缓存同步")
                         db.session.commit()
                     logger.info(f"Deployment succeeded for {name_tag}")
                 except Exception as err:
                     logger.exception("创建虚拟机失败：%s", name_tag)
-                    err_msg = public_error_message("创建虚拟机")
                     try:
                         t = db.session.get(DeploymentTask, task_id)
                         if t:
                             t.status = "Failed"
                             t.progress_msg = "创建失败"
-                            t.error_detail = err_msg
+                            set_task_error(t, err, "创建虚拟机")
                             db.session.commit()
                     except Exception:
                         pass
@@ -2076,9 +2188,9 @@ def vm_detail(sub_id, resource_group, vm_name):
         db.session.commit()
 
         return render_template("vm_detail.html", active_module="vms", subscription=subscription, account=account, vm=vm, vm_is_arm=AzureService.is_arm_vm_size(vm.get("vm_size", "")), active_task_type=active_task_type, active_task_snapshot=active_task_snapshot)
-    except Exception:
+    except Exception as error:
         logger.exception("获取虚拟机详情失败：%s", vm_name)
-        flash(public_error_message("获取虚拟机详情"), "danger")
+        flash(public_error_message("获取虚拟机详情", error), "danger")
         return redirect(url_for("vms_page", sub_id=sub_id))
 
 # 2. 费用模块
@@ -2099,39 +2211,36 @@ def costs_page():
 
 # ========================== 账单费用模块 (异步刷新与秒级开播) ==========================
 
-@app.route("/api/sub/<int:sub_id>/costs_refresh_action", methods=["POST"])
-@login_required
-def api_sub_costs_refresh_action(sub_id):
-    """立即创建 InProgress 任务，并后台异步刷新 Azure 账单"""
+def _submit_cost_refresh_task(sub_id):
+    """提交去重的费用后台任务；页面请求永远不直接等待 Azure Cost Management。"""
     subscription = Subscription.query.get_or_404(sub_id)
     account = subscription.account
-
     target_name = f"{subscription.display_name} 费用账单"
     reservation = reserve_unique_task(
         sub_id, "Azure Cost Management", target_name, "sync_costs",
         f"正在从 Azure Cost Management 查询【{subscription.display_name}】最新账单..."
     )
-    task_id = reservation["task_id"]
     if not reservation["created"]:
-        return jsonify({"status": "in_progress", "task_id": task_id,
-                        "target_name": target_name, "task_type": "sync_costs",
-                        "message": "该订阅已有账单刷新任务正在执行。"})
+        return reservation
 
     tenant_id = account.tenant_id
     client_id = account.client_id
     client_secret = account.client_secret
     sub_azure_id = subscription.subscription_id
     sub_name = subscription.display_name
+    task_id = reservation["task_id"]
 
     def async_fetch_costs():
         with app.app_context():
             costs_info = None
             fetch_error = None
             try:
-                costs_info = AzureService.get_subscription_costs(tenant_id, client_id, client_secret, sub_azure_id, force_refresh=True)
-            except Exception:
+                costs_info = AzureService.get_subscription_costs(
+                    tenant_id, client_id, client_secret, sub_azure_id, force_refresh=True
+                )
+            except Exception as error:
                 logger.exception("账单刷新失败：%s", sub_name)
-                fetch_error = public_error_message("账单刷新")
+                fetch_error = error
 
             try:
                 db.session.rollback()
@@ -2140,87 +2249,81 @@ def api_sub_costs_refresh_action(sub_id):
                     if not cost_rec:
                         cost_rec = CostCache(subscription_id=sub_id)
                         db.session.add(cost_rec)
-
                     cost_rec.total_cost = costs_info.get("total_cost", 0.0)
                     cost_rec.currency = costs_info.get("currency", "USD")
                     cost_rec.status = costs_info.get("status", "Success")
                     cost_rec.message = costs_info.get("message", "")
                     cost_rec.updated_at = datetime.utcnow()
 
-                t = db.session.get(DeploymentTask, task_id)
-                if t:
+                task = db.session.get(DeploymentTask, task_id)
+                if task:
                     if costs_info and costs_info.get("status") == "Success":
-                        t.status = "Succeeded"
-                        t.progress_msg = f"【{sub_name}】账单同步成功，本月消费: ${costs_info.get('total_cost')} {costs_info.get('currency')}"
+                        task.status = "Succeeded"
+                        task.progress_msg = f"【{sub_name}】账单同步成功，本月消费: ${costs_info.get('total_cost')} {costs_info.get('currency')}"
+                        task.error_detail = None
                     elif costs_info and costs_info.get("status") == "Warning":
-                        t.status = "Succeeded"
-                        t.progress_msg = f"【{sub_name}】账单同步完成 (部分数据受限)"
-                        t.error_detail = costs_info.get("message", "")
+                        task.status = "Succeeded"
+                        task.progress_msg = f"【{sub_name}】账单同步完成 (部分数据受限)"
+                        task.error_detail = costs_info.get("message", "")
                     else:
-                        t.status = "Failed"
-                        t.progress_msg = f"【{sub_name}】账单查询失败"
-                        t.error_detail = fetch_error or public_error_message("账单刷新")
+                        task.status = "Failed"
+                        task.progress_msg = f"【{sub_name}】账单查询失败"
+                        if fetch_error:
+                            set_task_error(task, fetch_error, "账单刷新")
+                        else:
+                            task.error_detail = costs_info.get("message", "账单接口未返回有效结果") if costs_info else "账单接口未返回有效结果"
                 db.session.commit()
             except Exception as commit_err:
-                logger.error(f"Failed to commit async task status: {commit_err}")
+                logger.error("账单任务状态写入失败：%s", commit_err)
                 db.session.rollback()
             finally:
                 db.session.remove()
 
     submit_background_task(async_fetch_costs, task_id=task_id)
-    return jsonify({"status": "submitted", "task_id": task_id, "target_name": target_name, "task_type": "sync_costs"})
+    return reservation
+
+
+@app.route("/api/sub/<int:sub_id>/costs_refresh_action", methods=["POST"])
+@login_required
+def api_sub_costs_refresh_action(sub_id):
+    """立即创建费用后台任务，响应不等待 Azure。"""
+    subscription = Subscription.query.get_or_404(sub_id)
+    reservation = _submit_cost_refresh_task(sub_id)
+    task_id = reservation["task_id"]
+    if not reservation["created"]:
+        return jsonify({"status": "in_progress", "task_id": task_id,
+                        "target_name": f"{subscription.display_name} 费用账单", "task_type": "sync_costs",
+                        "message": "该订阅已有账单刷新任务正在执行。"})
+    return jsonify({"status": "submitted", "task_id": task_id, "target_name": f"{subscription.display_name} 费用账单", "task_type": "sync_costs"})
 
 
 @app.route("/api/sub/<int:sub_id>/costs")
 @login_required
 def api_sub_costs(sub_id):
-    """费用本地秒开模式"""
+    """只读费用缓存；没有缓存时提交后台同步并立即返回。"""
     subscription = Subscription.query.get_or_404(sub_id)
-    account = subscription.account
-    force_refresh = (request.args.get("refresh") == "1")
-
-    # 优先从 SQLite 本地账单缓存读取 (10ms 秒开)
-    if not force_refresh:
-        cost_rec = CostCache.query.filter_by(subscription_id=sub_id).first()
-        if cost_rec and (datetime.utcnow() - cost_rec.updated_at).total_seconds() < 1800:
-            return jsonify({
-                "status": cost_rec.status,
-                "total_cost": cost_rec.total_cost,
-                "currency": cost_rec.currency,
-                "message": cost_rec.message,
-                "from_cache": True
-            })
-
-    costs_info = AzureService.get_subscription_costs(account.tenant_id, account.client_id, account.client_secret, subscription.subscription_id, force_refresh=force_refresh)
-
     cost_rec = CostCache.query.filter_by(subscription_id=sub_id).first()
-    if not cost_rec:
-        cost_rec = CostCache(subscription_id=sub_id)
-        db.session.add(cost_rec)
+    if cost_rec and (datetime.utcnow() - cost_rec.updated_at).total_seconds() < 1800:
+        return jsonify({
+            "status": cost_rec.status,
+            "total_cost": cost_rec.total_cost,
+            "currency": cost_rec.currency,
+            "message": cost_rec.message,
+            "from_cache": True,
+            "state": "fresh",
+        })
 
-    cost_rec.total_cost = costs_info.get("total_cost", 0.0)
-    cost_rec.currency = costs_info.get("currency", "USD")
-    cost_rec.status = costs_info.get("status", "Success")
-    cost_rec.message = costs_info.get("message", "")
-    cost_rec.updated_at = datetime.utcnow()
-
-    # 当用户主动点击刷新账单时，向活动日志静默写入一条任务记录
-    if force_refresh:
-        is_success = (costs_info.get("status") == "Success")
-        log_task = DeploymentTask(
-            subscription_id=sub_id,
-            task_type="sync_costs",
-            target_name=f"{subscription.display_name} 费用账单",
-            resource_group="Azure Cost Management",
-            status="Succeeded" if is_success else "Failed",
-            progress_msg=f"【{subscription.display_name}】账单同步成功，本月实际消费: ${costs_info.get('total_cost')} {costs_info.get('currency')}" if is_success else f"【{subscription.display_name}】账单同步受限/失败",
-            error_detail=costs_info.get("message", "") if not is_success else None
-        )
-        db.session.add(log_task)
-
-    db.session.commit()
-
-    return jsonify(costs_info)
+    reservation = _submit_cost_refresh_task(sub_id)
+    payload = {
+        "status": "Pending",
+        "state": "stale" if cost_rec else "pending",
+        "total_cost": cost_rec.total_cost if cost_rec else None,
+        "currency": cost_rec.currency if cost_rec else "USD",
+        "message": "费用正在后台查询，当前显示的是旧缓存。" if cost_rec else "费用正在后台查询，请稍后刷新页面。",
+        "from_cache": bool(cost_rec),
+        "task_id": reservation["task_id"],
+    }
+    return jsonify(payload), 202
 
 # 3. 活动日志模块
 
@@ -2228,7 +2331,7 @@ def _task_rule_name(task):
     rule_name = getattr(task, "rule_name", None)
     if rule_name:
         return rule_name
-    if task.task_type in ("firewall_add", "firewall_delete"):
+    if task.task_type in ("firewall_add", "firewall_update", "firewall_delete"):
         match = re.search(r"防火墙(?:安全)?规则【([^】]+)】", task.progress_msg or "")
         if match:
             return match.group(1)
@@ -2246,7 +2349,12 @@ def _task_payload(t):
         "rule_name": _task_rule_name(t),
         "status": t.status,
         "progress_msg": t.progress_msg,
-        "error_detail": public_error_message("任务") if t.status == "Failed" and t.error_detail else None,
+        "error_detail": t.error_detail if t.status == "Failed" and t.error_detail else None,
+        "error_code": t.error_code if t.status == "Failed" else None,
+        "error_category": t.error_category if t.status == "Failed" else None,
+        "retryable": t.retryable if t.status == "Failed" else None,
+        "request_id": t.request_id if t.status == "Failed" else None,
+        "provider_operation_id": t.provider_operation_id if t.status == "Failed" else None,
         "subscription_id": t.subscription_id,
         "created_at": format_datetime_tz(t.created_at, "%Y-%m-%d %H:%M:%S")
     }
@@ -2282,7 +2390,12 @@ def api_tasks_list():
             "rule_name": _task_rule_name(t),
             "status": t.status,
             "progress_msg": t.progress_msg,
-            "error_detail": public_error_message("任务") if t.status == "Failed" and t.error_detail else None,
+            "error_detail": t.error_detail if t.status == "Failed" and t.error_detail else None,
+            "error_code": t.error_code if t.status == "Failed" else None,
+            "error_category": t.error_category if t.status == "Failed" else None,
+            "retryable": t.retryable if t.status == "Failed" else None,
+            "request_id": t.request_id if t.status == "Failed" else None,
+            "provider_operation_id": t.provider_operation_id if t.status == "Failed" else None,
             "subscription_id": t.subscription_id,
             "created_at": format_datetime_tz(t.created_at, "%Y-%m-%d %H:%M:%S")
         } for t in tasks]
@@ -2387,7 +2500,7 @@ def accounts_page():
                 return redirect(url_for("accounts_page"))
             except Exception as e:
                 logger.exception("Azure 凭据验证失败")
-                flash(public_error_message("Azure 凭据验证"), "danger")
+                flash(public_error_message("Azure 凭据验证", e), "danger")
                 return redirect(url_for("accounts_page"))
 
     accounts = Account.query.all()
@@ -2456,13 +2569,12 @@ def account_sync_action(account_id):
                 db.session.commit()
             except Exception as exc:
                 logger.exception("账户订阅同步失败")
-                error_message = public_error_message("账户订阅同步")
                 db.session.rollback()
                 task = db.session.get(DeploymentTask, sync_task_id)
                 if task:
                     task.status = "Failed"
                     task.progress_msg = f"同步账户【{acc_name}】订阅失败"
-                    task.error_detail = error_message
+                    set_task_error(task, exc, "账户订阅同步")
                 db.session.commit()
             finally:
                 db.session.remove()
@@ -2573,7 +2685,7 @@ def settings_page():
                 if temp_restore_path and os.path.exists(temp_restore_path):
                     os.remove(temp_restore_path)
                 db.session.rollback()
-                flash(public_error_message("恢复数据库"), "danger")
+                flash(public_error_message("恢复数据库", e), "danger")
                 return redirect(url_for("settings_page", tab="general"))
 
         elif action == "add_script":
@@ -2638,9 +2750,9 @@ def download_backup():
     download_filename = f"azure_manager_backup_{now_str}.db"
     try:
         snapshot_path = create_consistent_database_snapshot()
-    except Exception:
+    except Exception as error:
         logger.exception("创建数据库快照失败")
-        flash(public_error_message("导出数据库备份"), "danger")
+        flash(public_error_message("导出数据库备份", error), "danger")
         return redirect(url_for("settings_page", tab="general"))
     response = send_file(
         snapshot_path,
@@ -2773,7 +2885,7 @@ def vm_resize(sub_id, resource_group, vm_name):
                 if task:
                     task.status = "Failed"
                     task.progress_msg = "调整虚拟机规格失败"
-                    task.error_detail = public_error_message("调整虚拟机规格")
+                    set_task_error(task, error, "调整虚拟机规格")
                 db.session.commit()
 
     submit_background_task(async_resize, task_id=task_id)
@@ -2876,14 +2988,13 @@ def vm_action(sub_id, resource_group, vm_name, action_type):
                 db.session.commit()
             except Exception as e:
                 logger.exception("虚拟机操作失败：%s/%s", action_type, vm_name)
-                err_msg = public_error_message("虚拟机操作")
                 try:
                     db.session.rollback()
                     t = db.session.get(DeploymentTask, task_id)
                     if t:
                         t.status = "Failed"
                         t.progress_msg = f"虚拟机【{action_name}】失败"
-                        t.error_detail = err_msg
+                        set_task_error(t, e, "虚拟机操作")
                     db.session.commit()
                 except Exception:
                     pass
@@ -2962,12 +3073,11 @@ def vm_change_ip(sub_id, resource_group, vm_name):
                     db.session.commit()
             except Exception as e:
                 logger.exception("更换公网 IP 失败：%s", vm_name)
-                err_msg = public_error_message("更换公网 IP")
                 t = db.session.get(DeploymentTask, task_id)
                 if t:
                     t.status = "Failed"
                     t.progress_msg = "更换公网 IP 失败"
-                    t.error_detail = err_msg
+                    set_task_error(t, e, "更换公网 IP")
                     db.session.commit()
 
     submit_background_task(async_change, task_id=task_id)
@@ -3061,7 +3171,7 @@ def vm_reinstall(sub_id, resource_group, vm_name):
             except Exception as e:
                 success = False
                 logger.exception("重装系统失败：%s", vm_name)
-                msg = public_error_message("重装系统")
+                msg = public_error_message("重装系统", e)
 
             try:
                 t = db.session.get(DeploymentTask, task_id)
@@ -3083,7 +3193,7 @@ def vm_reinstall(sub_id, resource_group, vm_name):
                         t.progress_msg = "重装失败，请查看活动日志或稍后重试。"
                         if msg and "回滚" in msg:
                             t.progress_msg = "重装失败，系统已尝试回滚，请核查虚拟机状态。"
-                        t.error_detail = public_error_message("重装系统")
+                        t.error_detail = msg
                     db.session.commit()
             except Exception:
                 pass
@@ -3183,12 +3293,11 @@ def vm_reset_credentials(sub_id, resource_group, vm_name):
                     db.session.commit()
             except Exception as e:
                 logger.exception("重置凭据失败：%s", vm_name)
-                err_msg = public_error_message("重置凭据")
                 t = db.session.get(DeploymentTask, task_id)
                 if t:
                     t.status = "Failed"
                     t.progress_msg = "重置凭据失败"
-                    t.error_detail = err_msg
+                    set_task_error(t, e, "重置凭据")
                     db.session.commit()
 
     submit_background_task(async_reset, task_id=task_id)
@@ -3215,7 +3324,9 @@ def vm_firewall(sub_id, resource_group, nsg_name):
 
     if request.method == "POST":
         action = request.form.get("action")
-        if action == "add_rule":
+        if action in ("add_rule", "update_rule"):
+            is_update = action == "update_rule"
+            rule_action_label = "修改" if is_update else "添加"
             rule_name = request.form.get("rule_name", "").strip()
             priority = request.form.get("priority", 1000)
             protocol = request.form.get("protocol", "Tcp")
@@ -3236,16 +3347,16 @@ def vm_firewall(sub_id, resource_group, nsg_name):
 
             reservation = reserve_unique_task(
                 sub_pk, resource_group, nsg_name,
-                task_type="firewall_add",
-                progress_msg=f"已提交添加防火墙规则【{rule_name}】任务...",
+                task_type="firewall_update" if is_update else "firewall_add",
+                progress_msg=f"已提交{rule_action_label}防火墙规则【{rule_name}】任务...",
                 rule_name=rule_name,
             )
             task_id = reservation["task_id"]
             if not reservation["created"]:
                 return jsonify({"status": "in_progress", "task_id": task_id,
-                                "task_type": "firewall_add", "target_name": nsg_name,
+                                "task_type": "firewall_update" if is_update else "firewall_add", "target_name": nsg_name,
                                 "rule_name": reservation.get("rule_name"),
-                                "message": "该安全组已有添加规则任务正在执行。"})
+                                "message": f"该安全组已有{rule_action_label}规则任务正在执行。"})
 
             def async_firewall_add():
                 with app.app_context():
@@ -3253,7 +3364,7 @@ def vm_firewall(sub_id, resource_group, nsg_name):
                         task = db.session.get(DeploymentTask, task_id)
                         if task:
                             task.status = "InProgress"
-                            task.progress_msg = f"正在向 Azure 写入防火墙规则【{rule_name}】..."
+                            task.progress_msg = f"正在向 Azure {rule_action_label}防火墙规则【{rule_name}】..."
                             db.session.commit()
                         AzureService.add_nsg_rule(
                             tenant_id, client_id, client_secret,
@@ -3263,18 +3374,17 @@ def vm_firewall(sub_id, resource_group, nsg_name):
                         task = db.session.get(DeploymentTask, task_id)
                         if task:
                             task.status = "Succeeded"
-                            task.progress_msg = f"防火墙安全规则【{rule_name}】已成功写入安全组【{nsg_name}】！"
+                            task.progress_msg = f"防火墙安全规则【{rule_name}】已成功{rule_action_label}至安全组【{nsg_name}】！"
                         db.session.commit()
                     except Exception as e:
                         logger.exception("添加防火墙规则失败")
-                        err_msg = public_error_message("添加防火墙规则")
                         try:
                             db.session.rollback()
                             task = db.session.get(DeploymentTask, task_id)
                             if task:
                                 task.status = "Failed"
-                                task.progress_msg = f"添加防火墙安全规则【{rule_name}】失败"
-                                task.error_detail = err_msg
+                                task.progress_msg = f"{rule_action_label}防火墙安全规则【{rule_name}】失败"
+                                set_task_error(task, e, f"{rule_action_label}防火墙规则")
                             db.session.commit()
                         except Exception:
                             db.session.rollback()
@@ -3283,8 +3393,8 @@ def vm_firewall(sub_id, resource_group, nsg_name):
 
             submit_background_task(async_firewall_add, task_id=task_id)
             if request.headers.get("X-Requested-With") == "XMLHttpRequest" or request.is_json:
-                return jsonify({"status": "submitted", "task_id": task_id, "task_type": "firewall_add", "target_name": nsg_name, "rule_name": rule_name, "nsg_name": nsg_name})
-            flash(f"已提交添加防火墙安全规则【{rule_name}】任务！", "info")
+                return jsonify({"status": "submitted", "task_id": task_id, "task_type": "firewall_update" if is_update else "firewall_add", "target_name": nsg_name, "rule_name": rule_name, "nsg_name": nsg_name})
+            flash(f"已提交{rule_action_label}防火墙安全规则【{rule_name}】任务！", "info")
             return redirect(url_for("vm_firewall", sub_id=sub_id, resource_group=resource_group, nsg_name=nsg_name))
 
         elif action == "delete_rule":
@@ -3327,14 +3437,13 @@ def vm_firewall(sub_id, resource_group, nsg_name):
                         db.session.commit()
                     except Exception as e:
                         logger.exception("删除防火墙规则失败")
-                        err_msg = public_error_message("删除防火墙规则")
                         try:
                             db.session.rollback()
                             task = db.session.get(DeploymentTask, task_id)
                             if task:
                                 task.status = "Failed"
                                 task.progress_msg = f"删除防火墙安全规则【{rule_name}】失败"
-                                task.error_detail = err_msg
+                                set_task_error(task, e, "删除防火墙规则")
                             db.session.commit()
                         except Exception:
                             db.session.rollback()
@@ -3356,7 +3465,7 @@ def vm_firewall(sub_id, resource_group, nsg_name):
         )
     except Exception as e:
         logger.exception("读取防火墙规则失败：%s", nsg_name)
-        error_msg = public_error_message("读取防火墙规则")
+        error_msg = public_error_message("读取防火墙规则", e)
 
     return render_template(
         "firewall.html",
@@ -3411,10 +3520,10 @@ def api_get_locations(sub_id):
             "source": "fresh",
             "locations": fresh_locations
         })
-    except Exception:
+    except Exception as error:
         logger.exception("Azure 缓存接口请求失败")
         db.session.rollback()
-        return jsonify({"status": "error", "message": public_error_message("Azure 缓存请求")}), 500
+        return jsonify({"status": "error", "message": public_error_message("Azure 缓存请求", error)}), 500
 
 @app.route("/api/sub/<int:sub_id>/skus/<location>")
 @login_required
@@ -3502,7 +3611,7 @@ def api_get_skus(sub_id, location):
                 "os_type": os_type,
                 "skus": [],
             })
-        return jsonify({"status": "error", "message": public_error_message("规格缓存请求")}), 500
+        return jsonify({"status": "error", "message": public_error_message("规格缓存请求", error)}), 500
 
 
 @app.route("/api/sub/<int:sub_id>/sku_prices/<location>")
@@ -3596,10 +3705,10 @@ def api_get_sku_prices(sub_id, location):
                 "price_updated_at": item.get("price_updated_at"),
             } for item in sku_payloads],
         })
-    except Exception:
+    except Exception as error:
         logger.exception("价格接口请求失败")
         db.session.rollback()
-        return jsonify({"status": "error", "message": public_error_message("价格请求")}), 500
+        return jsonify({"status": "error", "message": public_error_message("价格请求", error)}), 500
 
 @app.route("/api/sub/<int:sub_id>/images/<location>")
 @login_required
@@ -3656,10 +3765,10 @@ def api_get_dynamic_images(sub_id, location):
                 for image in data.get(architecture, []) if image.get("urn")
             ]
         return jsonify({"status": "success", "source": "fresh", "images": public_images})
-    except Exception:
+    except Exception as error:
         logger.exception("Azure 缓存接口请求失败")
         db.session.rollback()
-        return jsonify({"status": "error", "message": public_error_message("Azure 缓存请求")}), 500
+        return jsonify({"status": "error", "message": public_error_message("Azure 缓存请求", error)}), 500
 
 @app.route("/api/sub/<int:sub_id>/vm/<resource_group>/<vm_name>/resize_options")
 def api_vm_resize_options(sub_id, resource_group, vm_name):
@@ -3723,11 +3832,11 @@ def api_vm_resize_options(sub_id, resource_group, vm_name):
             "price_error": options.get("price_error"),
             "sizes": options.get("sizes", []),
         })
-    except Exception:
+    except Exception as error:
         logger.exception("读取虚拟机可调整规格失败：%s", vm_name)
         return jsonify({
             "status": "error",
-            "message": public_error_message("读取虚拟机可调整规格"),
+            "message": public_error_message("读取虚拟机可调整规格", error),
         }), 500
 
 
@@ -3760,9 +3869,9 @@ def api_reinstall_metadata(sub_id, resource_group, vm_name):
             "location": vm.get("location", ""),
             "architecture": "arm64" if AzureService.is_arm_vm_size(vm_size) else "x64"
         })
-    except Exception:
+    except Exception as error:
         logger.exception("读取当前虚拟机规格失败：%s", vm_name)
-        return jsonify({"status": "error", "message": public_error_message("读取当前虚拟机规格")}), 500
+        return jsonify({"status": "error", "message": public_error_message("读取当前虚拟机规格", error)}), 500
 
 @app.route("/api/sub/<int:sub_id>/vm/<resource_group>/<vm_name>/metrics")
 def api_vm_metrics(sub_id, resource_group, vm_name):
@@ -3781,9 +3890,9 @@ def api_vm_metrics(sub_id, resource_group, vm_name):
             subscription.subscription_id, resource_group, vm_name, hours=hours
         )
         return jsonify({"status": "success", "data": data})
-    except Exception:
+    except Exception as error:
         logger.exception("读取虚拟机监控指标失败：%s", vm_name)
-        return jsonify({"status": "error", "message": public_error_message("读取虚拟机监控指标")}), 500
+        return jsonify({"status": "error", "message": public_error_message("读取虚拟机监控指标", error)}), 500
 
 with app.app_context():
     initialize_database_schema()

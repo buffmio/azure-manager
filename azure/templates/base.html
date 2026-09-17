@@ -116,7 +116,7 @@
     const TASK_CHINESE_DICT = {
         'start': '开机', 'stop': '关机', 'restart': '重启', 'delete': '销毁',
         'reinstall': '重装系统', 'resize': '调整规格', 'change_ip': '更换公网 IP', 'reset_credentials': '重置凭据',
-        'create': '创建虚拟机', 'firewall_add': '添加规则', 'firewall_delete': '删除规则',
+        'create': '创建虚拟机', 'firewall_add': '添加规则', 'firewall_update': '修改规则', 'firewall_delete': '删除规则',
         'sync_subscriptions': '同步订阅', 'sync_vms': '同步虚拟机列表', 'sync_costs': '刷新费用账单'
     };
 
@@ -211,17 +211,22 @@
 
     function openModal(id) {
         const m = document.getElementById(id);
-        if (m) m.style.display = 'flex';
+        if (m) {
+            m.style.display = 'flex';
+            document.body.classList.add('modal-open');
+        }
     }
 
     function closeModal(id) {
         const m = document.getElementById(id);
         if (m) m.style.display = 'none';
+        if (!document.querySelector('.modal-overlay[style*="display: flex"]')) document.body.classList.remove('modal-open');
     }
 
     window.addEventListener('click', (e) => {
         if (e.target.classList.contains('modal-overlay')) {
             e.target.style.display = 'none';
+            if (!document.querySelector('.modal-overlay[style*="display: flex"]')) document.body.classList.remove('modal-open');
         }
     });
 
@@ -289,7 +294,7 @@
                 const dismissedIds = JSON.parse(localStorage.getItem('azure_drawer_dismissed_ids') || '[]');
 
                 // 筛选云资源核心生命周期任务，成功和失败结果也保留在通知中
-                const drawerSupportedTypes = ['create', 'start', 'stop', 'restart', 'delete', 'reinstall', 'resize', 'change_ip', 'reset_credentials', 'sync_costs', 'sync_subscriptions', 'sync_vms', 'firewall_add', 'firewall_delete'];
+            const drawerSupportedTypes = ['create', 'start', 'stop', 'restart', 'delete', 'reinstall', 'resize', 'change_ip', 'reset_credentials', 'sync_costs', 'sync_subscriptions', 'sync_vms', 'firewall_add', 'firewall_update', 'firewall_delete'];
                 const tasks = allTasks.filter(t => {
                     if (dismissedIds.includes(t.id)) return false;
                     const typeOk = drawerSupportedTypes.includes((t.task_type || '').toLowerCase());
@@ -352,11 +357,22 @@
                         const statusBadge = existingItem.querySelector('.badge');
                         const msgDiv = existingItem.querySelector('.azure-task-msg');
                         const progressBox = existingItem.querySelector('.azure-task-progress');
+                        let errorDiv = existingItem.querySelector('.azure-task-error');
                         if (statusBadge) {
                             statusBadge.className = `badge ${badgeClass}`;
                             statusBadge.textContent = statusLabel;
                         }
                         if (msgDiv) msgDiv.textContent = t.progress_msg;
+                        if (t.error_detail && !errorDiv) {
+                            errorDiv = document.createElement('div');
+                            errorDiv.className = 'azure-task-error';
+                            errorDiv.style.cssText = 'font-size: 0.75rem; color: var(--danger); word-break: break-all; margin-top: 0.25rem;';
+                            existingItem.insertBefore(errorDiv, existingItem.querySelector('.azure-task-item > div:last-child'));
+                        }
+                        if (errorDiv) {
+                            errorDiv.textContent = t.error_detail || '';
+                            errorDiv.style.display = t.error_detail ? 'block' : 'none';
+                        }
                         if (!isActive && progressBox) progressBox.remove();
                     } else {
                         // 新任务创建并插入到正确顺序位置 (若是最新任务直接置顶 prepend)
@@ -372,7 +388,7 @@
                                 </div>
                             </div>
                             <div class="azure-task-msg">${escapeHtml(t.progress_msg)}</div>
-                            ${t.error_detail ? `<div style="font-size: 0.75rem; color: var(--danger); word-break: break-all; margin-top: 0.25rem;">${escapeHtml(t.error_detail)}</div>` : ''}
+                            ${t.error_detail ? `<div class="azure-task-error" style="font-size: 0.75rem; color: var(--danger); word-break: break-all; margin-top: 0.25rem;">${escapeHtml(t.error_detail)}</div>` : ''}
                             <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.35rem; font-size: 0.75rem; color: var(--text-muted);">
                                 <span>${escapeHtml(t.created_at)}</span>
                                 <span>${escapeHtml(t.resource_group || "")}</span>

@@ -273,7 +273,6 @@
             <button type="button" class="modal-close" onclick="closeModal('resize-vm-modal')">&times;</button>
         </div>
         <form id="form-resize-vm" method="post" action="{{ url_for('vm_resize', sub_id=subscription.id, resource_group=vm.resource_group, vm_name=vm.name) }}">
-            <div id="resize-options-meta" style="display: none; margin-bottom: 0.65rem; color: var(--text-muted); font-size: 0.78rem;"></div>
             <div id="resize-options-error" class="alert alert-danger" style="display: none; margin-bottom: 0.75rem;"></div>
             <div class="form-group" id="resize-options-field" style="display: none;">
                 <label class="form-label" for="resize-size-select">目标规格</label>
@@ -289,7 +288,6 @@
                         <div class="custom-dropdown-item disabled">正在加载规格...</div>
                     </div>
                 </div>
-                <div id="resize-current-size" style="margin-top: 0.4rem; color: var(--text-muted); font-size: 0.8rem;"></div>
                 <div class="azure-form-status" id="resize-options-loading" style="display: none;"><span class="spec-loading-spinner" aria-hidden="true"></span><span class="spec-loading-label">规格加载中...</span></div>
             </div>
 
@@ -683,18 +681,15 @@ function openResizeModal() {
     if (resizeOptionsReady || resizeOptionsRequest) return;
 
     const loading = document.getElementById('resize-options-loading');
-    const meta = document.getElementById('resize-options-meta');
     const errorBox = document.getElementById('resize-options-error');
     const field = document.getElementById('resize-options-field');
     const select = document.getElementById('resize-size-select');
     const dropdown = document.getElementById('resize-size-custom-dropdown');
     const dropdownLabel = document.getElementById('resize-size-dropdown-label');
     const dropdownMenu = document.getElementById('resize-size-dropdown-menu');
-    const currentLabel = document.getElementById('resize-current-size');
     const submit = document.getElementById('resize-submit-btn');
 
     if (loading) loading.style.display = 'inline';
-    if (meta) meta.style.display = 'none';
     if (errorBox) { errorBox.style.display = 'none'; errorBox.textContent = ''; }
     if (field) field.style.display = 'block';
     // 加载期间保持规格选择框可见且可展开，提交按钮单独锁定，避免把“加载中”误显示成不可用。
@@ -713,14 +708,6 @@ function openResizeModal() {
             return data;
         }))
         .then(data => {
-            const sourceLabel = data.source === 'azure' ? 'Azure 短时缓存' : (data.source || '未知');
-            const cachedAt = data.cached_at ? new Date(Number(data.cached_at) * 1000).toLocaleString('zh-CN') : '未知';
-            const securityLabel = data.current_trusted_launch ? 'Trusted Launch' : (data.current_security_type || 'Standard');
-            if (meta) {
-                meta.textContent = `规格来源：${sourceLabel} · 缓存时间：${cachedAt} · 当前安全类型：${securityLabel}`;
-                meta.style.display = 'block';
-            }
-
             if (!data.supported) {
                 if (errorBox) {
                     errorBox.textContent = data.unsupported_reason || '当前虚拟机不支持调整规格';
@@ -826,7 +813,6 @@ function openResizeModal() {
                     if (submit) submit.disabled = select.value.toLowerCase() === currentSize.toLowerCase();
                 };
             }
-            if (currentLabel) currentLabel.textContent = `当前规格：${currentSize}`;
             if (field) field.style.display = 'block';
             if (submit) submit.disabled = !select || select.value.toLowerCase() === currentSize.toLowerCase();
             resizeOptionsReady = true;

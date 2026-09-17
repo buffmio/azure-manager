@@ -862,8 +862,64 @@ code {
   display: none;
   align-items: center;
   justify-content: center;
-  z-index: 100;
+  z-index: 200;
   padding: 1.5rem;
+}
+
+body.modal-open { overflow: hidden; }
+
+.firewall-rule-modal-content {
+  max-width: 720px;
+  padding: 1.25rem 1.5rem;
+}
+
+.firewall-rule-modal-content .modal-header {
+  margin-bottom: 1rem;
+  padding-bottom: 0.65rem;
+}
+
+.firewall-rule-form-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  column-gap: 0.85rem;
+  row-gap: 0.85rem;
+}
+
+.firewall-rule-form-grid .form-group {
+  min-width: 0;
+  margin-bottom: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.firewall-rule-form-grid .form-label {
+  min-height: 2.5rem;
+  margin-bottom: 0.35rem;
+  line-height: 1.3;
+  display: flex;
+  align-items: flex-start;
+}
+
+.firewall-rule-form-grid .form-control {
+  box-sizing: border-box;
+}
+
+.firewall-rule-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+@media (max-width: 760px) {
+  .firewall-rule-form-grid {
+    grid-template-columns: 1fr;
+    row-gap: 0.85rem;
+  }
+
+  .firewall-rule-form-grid .form-label {
+    min-height: 0;
+  }
 }
 
 .modal-content {

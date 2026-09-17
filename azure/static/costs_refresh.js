@@ -1,3 +1,10 @@
+function readCostTaskResponse(response) {
+    return response.text().then(text => {
+        try { return text ? JSON.parse(text) : {}; }
+        catch (e) { throw new Error(response.status === 401 ? "登录已过期，请重新登录" : `活动接口返回了无效响应（HTTP ${response.status}）`); }
+    });
+}
+
 function setCostRefreshBusy(busy) {
     const btn = document.getElementById("btn-refresh-cost");
     setButtonBusy(btn, busy, "刷新中...", "刷新账单");
@@ -5,7 +12,7 @@ function setCostRefreshBusy(busy) {
 
 function checkAndRestoreCostTasks() {
     fetch("/api/tasks/list", { cache: "no-store" })
-        .then(res => res.json())
+        .then(readCostTaskResponse)
         .then(data => {
             const active = (data.tasks || []).filter(t => t.task_type === "sync_costs" && (t.status === "InProgress" || t.status === "Pending"));
             if (!active.length) return;
@@ -54,7 +61,7 @@ function submitCostRefreshTasks(subIds, refreshBtn, onComplete) {
                 "X-CSRF-Token": window.csrfToken || ""
             }
         })
-            .then(res => res.json().then(data => ({ ok: res.ok, data })))
+            .then(res => readCostTaskResponse(res).then(data => ({ ok: res.ok, data })))
             .then(({ ok, data }) => {
                 const accepted = data.status === "submitted" || data.status === "in_progress";
                 if (!ok || !accepted || !data.task_id) {
