@@ -196,6 +196,22 @@ class VmCache(db.Model):
     auth_mode = db.Column(db.String(32), default='password')
     updated_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+
+class VmCacheSnapshot(db.Model):
+    """记录订阅最近一次成功完成 VM 列表同步的时间。
+
+    VmCache 按 VM 保存数据，空订阅没有对应行，因此需要单独的快照记录
+    来区分“同步结果为空”和“从未同步过”。
+    """
+    __tablename__ = 'vm_cache_snapshots'
+
+    subscription_id = db.Column(
+        db.Integer,
+        db.ForeignKey('subscriptions.id'),
+        primary_key=True,
+    )
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
 class CostCache(db.Model):
     __tablename__ = 'cost_cache'
 

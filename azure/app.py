@@ -31,7 +31,7 @@ from hmac import compare_digest
 
 from models import (db, User, LoginAttempt, Account, Subscription, SkuCache,
                     VmSkuPriceCache, VmResizeOptionsCache, LocationCache,
-                    ImageCache, ScriptTemplate, DeploymentTask, VmCache,
+                    ImageCache, ScriptTemplate, DeploymentTask, VmCache, VmCacheSnapshot,
                     CostCache, SystemSetting)
 from azure_service import AzureService, PRESET_IMAGES
 from sku_catalog import (
@@ -69,6 +69,9 @@ ERROR_CODE_MESSAGES = {
     "OperationNotAllowed": ("permission", "当前订阅或区域不允许执行此操作。", False),
     "ResourceNotFound": ("not_found", "目标 Azure 资源不存在或已被删除。", False),
     "NotFound": ("not_found", "目标 Azure 资源不存在或已被删除。", False),
+    "MissingSubscriptionRegistration": ("subscription_provider", "当前订阅未注册所需的 Azure 资源提供程序，请检查订阅权限后重试。", False),
+    "SubscriptionNotRegisteredForResourceType": ("subscription_provider", "当前订阅未注册所需的 Azure 资源提供程序，请检查订阅权限后重试。", False),
+    "SubscriptionIsNotRegisteredForResourceType": ("subscription_provider", "当前订阅未注册所需的 Azure 资源提供程序，请检查订阅权限后重试。", False),
     "Conflict": ("conflict", "资源当前状态不允许执行此操作，请刷新状态后重试。", True),
     "InvalidParameter": ("validation", "请求参数不符合 Azure 要求，请检查输入内容。", False),
     "InvalidRequest": ("validation", "请求参数不符合 Azure 要求，请检查输入内容。", False),
@@ -111,12 +114,36 @@ def describe_azure_error(error, operation="Azure 操作"):
     status_code = getattr(error, "status_code", None)
     category, message, retryable = ERROR_CODE_MESSAGES.get(code, (None, None, None))
     lowered = text.lower()
+    provider_match = re.search(r"namespace ['\"]([^'\"]+)['\"]", text, re.IGNORECASE)
+    provider_namespace = provider_match.group(1) if provider_match else None
+    if provider_namespace and (
+        code in {
+            "MissingSubscriptionRegistration",
+            "SubscriptionNotRegisteredForResourceType",
+            "SubscriptionIsNotRegisteredForResourceType",
+        }
+        or "subscription is not registered" in lowered
+        or "missing subscription registration" in lowered
+    ):
+        category = "subscription_provider"
+        message = f"当前订阅未注册 Azure 资源提供程序 {provider_namespace}，系统会在创建流程中自动尝试注册；若仍失败，请检查订阅权限。"
+        retryable = False
     if not category and (status_code == 429 or "too many requests" in lowered or "rate limit" in lowered):
         code, category, message, retryable = code if code != "AzureError" else "TooManyRequests", "rate_limit", "Azure 接口暂时限流，请稍后重试。", True
     elif not category and ("timeout" in lowered or "timed out" in lowered):
         code, category, message, retryable = "Timeout", "timeout", "Azure 请求超时，请稍后查看任务状态或重试。", True
     elif not category and ("allocation" in lowered and "capacity" in lowered):
         code, category, message, retryable = "AllocationFailed", "capacity", "该区域当前没有足够的虚拟机容量，请更换规格或区域后重试。", True
+    elif not category and (
+        "subscription is not registered" in lowered
+        or "missing subscription registration" in lowered
+        or "not registered to use namespace" in lowered
+    ):
+        code, category, message, retryable = (
+            "MissingSubscriptionRegistration", "subscription_provider",
+            "当前订阅未注册所需的 Azure 资源提供程序，系统会在创建流程中自动尝试注册；若仍失败，请检查订阅权限。",
+            False,
+        )
     elif not category:
         category, message, retryable = "provider", text, False
     request_id = _azure_error_request_id(error)
@@ -1668,6 +1695,16 @@ def vms_page():
         account=account
     )
 
+def mark_vm_cache_snapshot(subscription_id, updated_at=None):
+    """记录一次完整成功的 VM 列表同步，即使同步结果为空。"""
+    snapshot = VmCacheSnapshot.query.filter_by(subscription_id=subscription_id).first()
+    if snapshot is None:
+        snapshot = VmCacheSnapshot(subscription_id=subscription_id)
+        db.session.add(snapshot)
+    snapshot.updated_at = updated_at or datetime.utcnow()
+    return snapshot
+
+
 @app.route("/api/sub/vms_data")
 def api_sub_vms_data():
     """本地数据库优先极速秒开，强制刷新以后台任务方式执行。"""
@@ -1731,9 +1768,31 @@ def api_sub_vms_data():
     if not force_refresh:
         cached_records = VmCache.query.filter_by(subscription_id=sub_id).all() if sub_id else VmCache.query.all()
         cache_expiry = datetime.utcnow() - timedelta(minutes=15)
-        cache_has_all_subscriptions = {record.subscription_id for record in cached_records} == {subscription.id for subscription in target_subs}
-        cache_is_fresh = bool(cached_records) and cache_has_all_subscriptions and all(
-            record.updated_at and record.updated_at >= cache_expiry for record in cached_records
+        target_subscription_ids = {subscription.id for subscription in target_subs}
+        records_by_subscription = {}
+        for record in cached_records:
+            records_by_subscription.setdefault(record.subscription_id, []).append(record)
+
+        snapshots = VmCacheSnapshot.query.filter(
+            VmCacheSnapshot.subscription_id.in_(target_subscription_ids)
+        ).all() if target_subscription_ids else []
+        snapshot_by_subscription = {snapshot.subscription_id: snapshot for snapshot in snapshots}
+
+        # 新版使用快照明确记录“同步成功但结果为空”；旧版没有快照时，
+        # 继续以现有 VM 行的最早更新时间兼容非空缓存。
+        cache_timestamps = {}
+        for subscription_id in target_subscription_ids:
+            snapshot = snapshot_by_subscription.get(subscription_id)
+            if snapshot and snapshot.updated_at:
+                cache_timestamps[subscription_id] = snapshot.updated_at
+                continue
+            records = records_by_subscription.get(subscription_id, [])
+            if records and all(record.updated_at for record in records):
+                cache_timestamps[subscription_id] = min(record.updated_at for record in records)
+
+        cache_is_fresh = bool(target_subscription_ids) and (
+            cache_timestamps.keys() == target_subscription_ids
+            and all(timestamp >= cache_expiry for timestamp in cache_timestamps.values())
         )
         if cache_is_fresh:
             return jsonify({"status": "success", "vms": load_cached_vms(), "active_tasks": load_active_tasks(), "from_cache": True})
@@ -1799,6 +1858,7 @@ def api_sub_vms_data():
                         auth_mode=vm.get("auth_mode", "password"),
                         updated_at=datetime.utcnow()
                     ))
+                mark_vm_cache_snapshot(params["sub_id"])
                 db.session.commit()
             return {"sub_id": params["sub_id"], "vms": vms, "error": None}
         except Exception as exc:
@@ -2057,6 +2117,7 @@ def create_vm_page():
                                 updated_at=datetime.utcnow()
                             )
                             db.session.add(rec)
+                        mark_vm_cache_snapshot(create_subscription_id)
                         db.session.commit()
                         AzureService._vm_cache.pop(f"vms_{subscription_azure_id}", None)
                     except Exception as cache_err:

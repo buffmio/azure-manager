@@ -46,6 +46,8 @@ VM_RESIZE_OPTIONS_CACHE_TTL_SECONDS = 60
 RETAIL_PRICES_CACHE_TTL_SECONDS = 6 * 60 * 60
 RETAIL_PRICES_TOTAL_TIMEOUT_SECONDS = 20
 AZURE_RETAIL_PRICES_URL = "https://prices.azure.com/api/retail/prices"
+RESOURCE_PROVIDER_REGISTRATION_TIMEOUT_SECONDS = 300
+RESOURCE_PROVIDER_STATUS_CACHE_TTL_SECONDS = 300
 
 
 def wait_for_azure_poller(poller):
@@ -177,6 +179,8 @@ class AzureService:
     _retail_prices_cache = {}
     _retail_prices_cache_locks = {}
     _retail_prices_cache_lock = threading.Lock()
+    _resource_provider_status_cache = {}
+    _resource_provider_registration_lock = threading.Lock()
 
     @staticmethod
     def secret_fingerprint(client_secret: str) -> str:
@@ -222,11 +226,86 @@ class AzureService:
 
     @classmethod
     def get_resource_client(cls, tenant_id: str, client_id: str, client_secret: str, subscription_id: str) -> ResourceManagementClient:
-        key = f"res_{tenant_id}_{client_id}_{subscription_id}"
+        key = f"res_{tenant_id}_{client_id}_{cls.secret_fingerprint(client_secret)}_{subscription_id}"
         if key not in cls._clients_pool:
             cred = cls.get_credential(tenant_id, client_id, client_secret)
             cls._clients_pool[key] = ResourceManagementClient(cred, subscription_id)
         return cls._clients_pool[key]
+
+    @classmethod
+    def ensure_resource_provider_registered(cls, tenant_id: str, client_id: str,
+                                            client_secret: str, subscription_id: str,
+                                            provider_namespace: str = "Microsoft.Network",
+                                            progress_callback=None) -> None:
+        """在创建 VM 前静默确保订阅已注册所需资源提供程序。"""
+        provider_label = {
+            "Microsoft.Network": "网络",
+            "Microsoft.Compute": "计算",
+        }.get(provider_namespace, provider_namespace)
+        cache_key = (
+            tenant_id.strip(), client_id.strip(), cls.secret_fingerprint(client_secret),
+            subscription_id.strip(), provider_namespace
+        )
+        now = time.monotonic()
+        cached_until = cls._resource_provider_status_cache.get(cache_key, 0)
+        if cached_until > now:
+            return
+
+        # 注册是订阅级幂等操作；并发创建时只允许一个线程查询/注册/轮询。
+        with cls._resource_provider_registration_lock:
+            now = time.monotonic()
+            if cls._resource_provider_status_cache.get(cache_key, 0) > now:
+                return
+
+            resource_client = cls.get_resource_client(
+                tenant_id, client_id, client_secret, subscription_id
+            )
+            provider = resource_client.providers.get(provider_namespace)
+            state = str(getattr(provider, "registration_state", "") or "").lower()
+            if state == "registered":
+                cls._resource_provider_status_cache[cache_key] = (
+                    now + RESOURCE_PROVIDER_STATUS_CACHE_TTL_SECONDS
+                )
+                return
+
+            report_operation_progress(
+                progress_callback, f"正在准备{provider_label}资源，请稍候..."
+            )
+            registration_requested = False
+            if state not in {"registering", "pending", "unregistering"}:
+                resource_client.providers.register(provider_namespace)
+                registration_requested = True
+
+            deadline = time.monotonic() + RESOURCE_PROVIDER_REGISTRATION_TIMEOUT_SECONDS
+            last_reported_state = None
+            while time.monotonic() < deadline:
+                provider = resource_client.providers.get(provider_namespace)
+                state = str(getattr(provider, "registration_state", "") or "").lower()
+                if state == "registered":
+                    cls._resource_provider_status_cache[cache_key] = (
+                        time.monotonic() + RESOURCE_PROVIDER_STATUS_CACHE_TTL_SECONDS
+                    )
+                    report_operation_progress(
+                        progress_callback, f"{provider_label}资源已准备完成，继续创建虚拟机..."
+                    )
+                    return
+                if state in {"failed", "rejected"}:
+                    raise RuntimeError(
+                        f"Azure 资源提供程序 {provider_namespace} 注册失败（状态：{state}）"
+                    )
+                if state in {"notregistered", "unregistered"} and not registration_requested:
+                    resource_client.providers.register(provider_namespace)
+                    registration_requested = True
+                if state != last_reported_state:
+                    report_operation_progress(
+                        progress_callback, f"正在等待 Azure {provider_label}资源注册完成..."
+                    )
+                    last_reported_state = state
+                time.sleep(3)
+
+            raise TimeoutError(
+                f"等待 Azure 资源提供程序 {provider_namespace} 注册超时"
+            )
 
     @classmethod
     def list_subscriptions(cls, tenant_id: str, client_id: str, client_secret: str) -> List[Dict[str, Any]]:
@@ -1232,6 +1311,14 @@ class AzureService:
         resource_client = ResourceManagementClient(cred, subscription_id)
         network_client = NetworkManagementClient(cred, subscription_id)
         compute_client = ComputeManagementClient(cred, subscription_id)
+
+        # 0. 创建所需资源提供程序未注册时由创建流程静默注册并等待完成。
+        for provider_namespace in ("Microsoft.Network", "Microsoft.Compute"):
+            cls.ensure_resource_provider_registered(
+                tenant_id, client_id, client_secret, subscription_id,
+                provider_namespace=provider_namespace,
+                progress_callback=update_progress,
+            )
 
         # 1. 确保资源组存在
         update_progress("1/6 正在创建资源组...")
