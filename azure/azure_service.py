@@ -1957,8 +1957,9 @@ class AzureService:
             # Linux 虚拟机同一个 handler 只能安装一个扩展。门户创建的 VM
             # 可能已用其他资源名称注册该扩展，因此应更新已有资源。
             extensions = compute_client.virtual_machine_extensions.list(resource_group, vm_name)
+            extension_items = extensions.value if hasattr(extensions, "value") else extensions
             matching_extensions = [
-                extension for extension in extensions
+                extension for extension in extension_items
                 if (extension.publisher or "").casefold() == publisher.casefold()
                 and (extension.type or "").casefold() == ext_type.casefold()
             ]
