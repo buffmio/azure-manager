@@ -526,6 +526,18 @@ code {
   color: #0369a1;
 }
 
+/* IP 地址使用等宽数字，避免不同数字宽度导致视觉跳动。 */
+.ip-address {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+  letter-spacing: 0.015em;
+}
+
+.vm-list-table .ip-address {
+  font-size: 0.8rem;
+}
+
 /* 表单控件 */
 .form-group {
   margin-bottom: 1rem;

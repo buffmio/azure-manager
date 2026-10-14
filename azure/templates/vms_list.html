@@ -326,7 +326,7 @@ function loadVMsData(forceRefresh = false) {
                         </td>
                         <td>${escapeHtml(vm.location)}</td>
                         <td class="table-compact">
-                            <code style="font-weight: 600; color: #0284c7; font-size: 0.85rem;">${escapeHtml(vm.public_ip)}</code>
+                            <code class="ip-address" style="font-weight: 600; color: #0284c7;">${escapeHtml(vm.public_ip)}</code>
                         </td>
                         <td class="table-status">
                             <span class="badge ${badgeClass}" id="vm-status-badge-${escapeHtml(vm.name)}">${powerStatusText}</span>

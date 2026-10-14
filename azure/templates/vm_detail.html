@@ -47,7 +47,7 @@
 <div class="stats-grid">
     <div class="stat-box">
         <span class="stat-label">公网 IPv4</span>
-        <span class="stat-value" style="font-size: 1.25rem; color: #0284c7; word-break: break-all;">{{ vm.public_ip }}</span>
+        <span class="stat-value ip-address" style="font-size: 1.25rem; color: #0284c7; word-break: break-all;">{{ vm.public_ip }}</span>
         <div style="margin-top: 0.75rem;">
             <button type="button" id="btn-open-change-ip" class="btn btn-outline btn-sm" style="width: 100%;" onclick="openModal('change-ip-modal')">更换公网 IP</button>
         </div>
@@ -313,7 +313,7 @@
             <button type="button" class="modal-close" onclick="closeModal('change-ip-modal')">&times;</button>
         </div>
         <div style="color: var(--text-main); font-size: 0.9rem; margin-bottom: 1rem;">
-            当前公网 IP: <code style="font-weight: 600; color: var(--primary);">{{ vm.public_ip }}</code>
+            当前公网 IP: <code class="ip-address" style="font-weight: 600; color: var(--primary);">{{ vm.public_ip }}</code>
             <p style="margin-top: 0.5rem; color: var(--text-muted); font-size: 0.85rem;">
                 确认后系统将向 Azure 申请全新分配的静态 Standard 公网 IPv4 并热重绑到当前网卡，释放原有旧 IP。
             </p>
@@ -1115,7 +1115,7 @@ function applyDetailTaskState(task) {
         else if (tt === "resize") stText = "调整规格中";
         else if (tt === "reset_credentials") stText = "重置凭据中";
         else if (tt === "change_ip") stText = "更换IP中";
-        topBadge.className = "badge badge-warning";
+        topBadge.className = `badge ${tt === "delete" ? "badge-danger" : "badge-warning"}`;
         topBadge.innerHTML = `<svg class="spin status-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg> ${stText}`;
     }
 

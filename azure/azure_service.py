@@ -5,6 +5,7 @@ import base64
 import hashlib
 import logging
 import threading
+import uuid
 import requests
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
@@ -1953,6 +1954,17 @@ class AzureService:
             }
             settings = {}
 
+            # Linux 虚拟机同一个 handler 只能安装一个扩展。门户创建的 VM
+            # 可能已用其他资源名称注册该扩展，因此应更新已有资源。
+            extensions = compute_client.virtual_machine_extensions.list(resource_group, vm_name)
+            matching_extensions = [
+                extension for extension in extensions
+                if (extension.publisher or "").casefold() == publisher.casefold()
+                and (extension.type or "").casefold() == ext_type.casefold()
+            ]
+            if matching_extensions:
+                ext_name = matching_extensions[0].name
+
         ext_model = VirtualMachineExtension(
             location=location,
             properties=VirtualMachineExtensionProperties(
@@ -1960,6 +1972,7 @@ class AzureService:
                 type=ext_type,
                 type_handler_version=version,
                 auto_upgrade_minor_version=True,
+                force_update_tag=str(uuid.uuid4()),
                 settings=settings,
                 protected_settings=protected_settings
             )

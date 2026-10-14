@@ -101,7 +101,7 @@ window.addEventListener('DOMContentLoaded', () => {
                         <div>{{ vm.vm_size }}</div>
                         <div style="font-size: 0.75rem; color: var(--text-muted);">{{ vm.location }}</div>
                     </td>
-                    <td><code>{{ vm.public_ip }}</code></td>
+                    <td><code class="ip-address">{{ vm.public_ip }}</code></td>
                     <td>
                         {% if 'running' in vm.power_state.lower() %}
                             <span class="badge badge-success">运行中</span>
