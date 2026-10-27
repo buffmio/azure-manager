@@ -1,0 +1,197 @@
+{% extends 'base.html' %}
+
+{% block title %}活动日志{% endblock %}
+
+{% block content %}
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; flex-wrap: wrap; gap: 0.75rem;">
+    <div>
+        <h2 style="font-size: 1.35rem; font-weight: 700; margin-bottom: 0;">活动日志</h2>
+        <span style="color: var(--text-muted); font-size: 0.85rem;">
+            当前监控范围: <strong>{{ current_sub.display_name if current_sub else '全部管理操作' }}</strong> (全自动实时监听)
+        </span>
+    </div>
+    <div style="display: flex; gap: 0.5rem; align-items: center;">
+        <select class="form-control toolbar-select" onchange="location.href='/tasks' + (this.value ? '?sub_id=' + this.value : '');">
+            <option value="">-- 全部订阅流水 --</option>
+            {% for acc in all_accounts %}
+                <optgroup label="账户: {{ acc.name }}">
+                    {% for s in acc.subscriptions %}
+                    <option value="{{ s.id }}" {% if current_sub and current_sub.id == s.id %}selected{% endif %}>
+                        {{ s.display_name }} ({{ s.subscription_id[:8] }}...)
+                    </option>
+                    {% endfor %}
+                </optgroup>
+            {% endfor %}
+        </select>
+        <button class="btn btn-danger btn-sm" onclick="openModal('clear-tasks-modal')">清空活动日志</button>
+    </div>
+</div>
+
+<div class="card" style="min-height: 400px;">
+    <div id="tasks-empty" style="display: none; text-align: center; padding: 4rem; color: var(--text-muted);">
+        <p>暂无任何活动记录</p>
+    </div>
+
+    <div class="table-responsive" id="tasks-table-box" style="display: block;">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th style="width: 140px;">时间</th>
+                    <th style="width: 160px;">操作目标 / RG</th>
+                    <th style="width: 100px;">任务类型</th>
+                    <th class="table-status" style="width: 90px;">状态</th>
+                    <th class="table-description" style="max-width: 380px;">任务执行进展 / 错误明细</th>
+                    <th class="table-actions" style="width: 60px;">操作</th>
+                </tr>
+            </thead>
+            <tbody id="tasks-tbody"></tbody>
+        </table>
+    </div>
+</div>
+
+<!-- 清空日志模态弹窗 -->
+<div id="clear-tasks-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 500px;">
+        <div class="modal-header">
+            <div class="modal-title" style="color: var(--danger);">清空活动日志确认</div>
+            <button type="button" class="modal-close" onclick="closeModal('clear-tasks-modal')">&times;</button>
+        </div>
+        <div style="color: var(--text-main); font-size: 0.9rem; margin-bottom: 1rem;">
+            确定要清空当前筛选范围内的活动日志吗？
+            <p style="margin-top: 0.5rem; color: var(--text-muted); font-size: 0.85rem;">
+                仅清空可删除的活动日志；进行中的任务和不可删除记录不会受到影响。
+            </p>
+        </div>
+        <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+            <button type="button" class="btn btn-outline" onclick="closeModal('clear-tasks-modal')">取消</button>
+            <button type="button" class="btn btn-danger" id="btn-confirm-clear-logs" onclick="confirmClearAllLogs()">确认清空</button>
+        </div>
+    </div>
+</div>
+
+<script>
+let timer = null;
+function taskActionCell(t) {
+    if (!t.deletable) return `<span style="color: var(--text-muted); font-size: 0.75rem;">不可删除</span>`;
+    return `<button onclick="deleteSingleTask(${t.id}, this)" class="btn btn-outline btn-xs" style="padding: 0.15rem 0.45rem; font-size: 0.75rem;" title="删除记录">×</button>`;
+}
+
+function pollAllTasks() {
+    const subParam = '{{ current_sub.id if current_sub else "" }}';
+    const url = `/api/activity/list${subParam ? "?sub_id=" + subParam : ""}`;
+    fetch(url, { cache: "no-store" })
+        .then(res => res.json())
+        .then(data => {
+            const emptyBox = document.getElementById('tasks-empty');
+            const tableBox = document.getElementById('tasks-table-box');
+            const tbody = document.getElementById('tasks-tbody');
+            const tasks = data.records || [];
+
+            if (tasks.length === 0) {
+                emptyBox.style.display = 'block';
+                tableBox.style.display = 'none';
+                return;
+            }
+
+            emptyBox.style.display = 'none';
+            tableBox.style.display = 'block';
+            tbody.innerHTML = '';
+
+            tasks.forEach(t => {
+                const tr = document.createElement('tr');
+                let badgeClass = 'badge-warning';
+                let statusText = '执行中';
+                if (t.status === 'Succeeded') {
+                    badgeClass = 'badge-success';
+                    statusText = '已完成';
+                } else if (t.status === 'Failed') {
+                    badgeClass = 'badge-danger';
+                    statusText = '失败';
+                }
+
+                tr.innerHTML = `
+                    <td style="color: var(--text-muted);">${escapeHtml(t.created_at)}</td>
+                    <td>
+                        <strong>${escapeHtml(t.target_name)}</strong>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">${escapeHtml(t.resource_group)}</div>
+                    </td>
+                    <td><span class="badge badge-secondary" style="font-size: 0.75rem; font-weight: 500;">${escapeHtml(t.task_type)}</span></td>
+                    <td class="table-status"><span class="badge ${badgeClass}" style="font-size: 0.75rem;">${statusText}</span></td>
+                    <td class="table-description" style="max-width: 380px; min-width: 220px;">
+                        <div style="color: ${t.status === 'Failed' ? 'var(--danger)' : 'var(--text-main)'}; font-size: 0.85rem; font-weight: ${t.status === 'Failed' ? '600' : '400'};">
+                            ${escapeHtml(t.progress_msg)}
+                        </div>
+                        ${t.error_detail ? `<div class="alert alert-danger" style="margin-top: 0.35rem; margin-bottom: 0; padding: 0.35rem 0.5rem; font-size: 0.75rem; word-break: break-all; max-height: 64px; overflow-y: auto; line-height: 1.35;">错误: ${escapeHtml(t.error_detail)}</div>` : ""}                    </td>
+                    <td class="table-actions">
+                        ${taskActionCell(t)}                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        })
+        .catch(err => {
+            console.error("Failed to poll all tasks:", err);
+        });
+}
+
+function confirmClearAllLogs() {
+    const btn = document.getElementById('btn-confirm-clear-logs');
+    if (btn) {
+        setButtonBusy(btn, true, '清空中...', null);
+    }
+    const subParam = '{{ current_sub.id if current_sub else "" }}';
+    fetch(`/api/tasks/clear${subParam ? '?sub_id=' + subParam : ''}`, { method: 'POST', headers: { 'X-CSRF-Token': '{{ csrf_token }}', 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(res => res.json().then(data => ({ ok: res.ok, data })))
+        .then(({ ok, data }) => {
+            if (!ok || data.status !== 'success') {
+                throw new Error(data.message || '活动日志清空失败');
+            }
+            closeModal('clear-tasks-modal');
+            if (btn) {
+                setButtonBusy(btn, false, '', '确认清空');
+            }
+            document.getElementById('tasks-tbody').innerHTML = '';
+            document.getElementById('tasks-table-box').style.display = 'none';
+            document.getElementById('tasks-empty').style.display = 'block';
+            showTopAlert('已清空可删除活动日志。', 'success');
+            pollAllTasks();
+        })
+        .catch(err => {
+            console.error("Failed to clear tasks:", err);
+            showTopAlert('活动日志清空失败：' + (err.message || '网络连接异常，请稍后重试'), 'danger');
+            closeModal('clear-tasks-modal');
+            if (btn) {
+                setButtonBusy(btn, false, '', '确认清空');
+            }
+        });
+}
+
+function deleteSingleTask(taskId, btnEl) {
+    if (btnEl) setButtonBusy(btnEl, true, '删除中...', null);
+    const sendDelete = () => fetch(`/api/tasks/${taskId}/delete`, { method: 'POST', headers: { 'X-CSRF-Token': '{{ csrf_token }}', 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(res => res.json().then(data => ({ ok: res.ok, data })))
+        .then(({ ok, data }) => {
+            if (!ok || data.status !== 'success') {
+                throw new Error(data.message || '活动记录删除失败');
+            }
+            showTopAlert('已删除单条活动记录。', 'success');
+            pollAllTasks();
+        })
+        .catch(err => {
+            console.error("Failed to delete task:", err);
+            if (btnEl) setButtonBusy(btnEl, false, '', '×');
+            showTopAlert('活动记录删除失败：' + (err.message || '网络连接异常，请稍后重试'), 'danger');
+        });
+    if (btnEl) setTimeout(() => { sendDelete(); }, 0);
+    else sendDelete();
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+    pollAllTasks();
+    timer = setInterval(pollAllTasks, 3000);
+});
+
+window.addEventListener('beforeunload', () => {
+    if (timer) clearInterval(timer);
+});
+</script>
+{% endblock %}

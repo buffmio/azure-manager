@@ -1,0 +1,102 @@
+{% extends 'base.html' %}
+{% block title %}费用与账单概览{% endblock %}
+
+{% block content %}
+<script>window.csrfToken = "{{ csrf_token }}";</script>
+<script src="{{ url_for('static', filename='costs_refresh.js') }}?v=20260818-2"></script>
+<script>window.costTargetSubIds = [{% for sub in (target_subs if target_subs else all_subs) %}{{ sub.id }},{% endfor %}];</script>
+<script src="{{ url_for('static', filename='costs_page.js') }}?v=20260818-2"></script>
+<div class="costs-page">
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; flex-wrap: wrap; gap: 0.75rem;">
+    <div>
+        <h2 style="font-size: 1.35rem; font-weight: 700; margin-bottom: 0;">订阅费用与消费概览</h2>
+        <span style="color: var(--text-muted); font-size: 0.85rem;">
+            当前统计范围: <strong>{{ current_sub.display_name if current_sub else '全部有效订阅' }}</strong>
+            {% if current_sub %}(<span class="costs-id">{{ current_sub.subscription_id }}</span>){% endif %}
+        </span>
+    </div>
+    <div style="display: flex; gap: 0.5rem; align-items: center;">
+        <select class="form-control toolbar-select" onchange="location.href='/costs' + (this.value ? '?sub_id=' + this.value : '');">
+            <option value="">-- 全部订阅总览 --</option>
+            {% for acc in all_accounts %}
+                <optgroup label="账户: {{ acc.name }}">
+                    {% for s in acc.subscriptions %}
+                    <option value="{{ s.id }}" {% if current_sub and current_sub.id == s.id %}selected{% endif %}>
+                        {{ s.display_name }} ({{ s.subscription_id[:8] }}...)
+                    </option>
+                    {% endfor %}
+                </optgroup>
+            {% endfor %}
+        </select>
+        <button class="btn btn-outline btn-sm" id="btn-refresh-cost" onclick="loadCostsData(true)">刷新账单</button>
+    </div>
+</div>
+
+<div class="stats-grid" style="grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); margin-bottom: 1.25rem;">
+    <div class="stat-box">
+        <span class="stat-label">本月实际消费 (Month to Date)</span>
+        <span class="stat-value costs-summary-value costs-total-value" style="color: var(--primary);" id="total-cost-display">正在计算...</span>
+        <div style="margin-top: 0.5rem; font-size: 0.8rem; color: var(--text-muted);">
+            统计周期: 本月 1 日至今 (精确至分)
+        </div>
+    </div>
+    <div class="stat-box">
+        <span class="stat-label">订阅统计范围</span>
+        <span class="stat-value costs-summary-value costs-scope-value">
+            {% if current_sub %}
+                {{ current_sub.display_name }}
+            {% else %}
+                全部有效订阅 (共 {{ all_subs|length }} 个)
+            {% endif %}
+        </span>
+        <div style="margin-top: 0.5rem; font-size: 0.8rem; color: var(--text-muted);">
+            {% if current_sub %}
+                所属账户: {{ current_sub.account.name }} | 订阅 ID: {{ current_sub.subscription_id }}
+            {% else %}
+                已汇总当前 {{ all_accounts|length }} 个云账户下的所有计费数据
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-title">各订阅账单明细列表</div>
+    <div class="table-responsive">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>所属账户</th>
+                    <th>订阅名称</th>
+                    <th class="table-id">订阅 ID</th>
+                    <th class="table-status">状态 / 额度</th>
+                    <th class="table-number">本月已产生费用</th>
+                    <th class="table-actions">操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for sub in (target_subs if target_subs else all_subs) %}
+                <tr>
+                    <td><strong>{{ sub.account.name }}</strong></td>
+                    <td>{{ sub.display_name }}</td>
+                    <td class="table-id"><span class="costs-id">{{ sub.subscription_id }}</span></td>
+                    <td class="table-status">
+                        <span class="badge badge-success">{{ sub.state }}</span>
+                        {% if sub.spending_limit and sub.spending_limit != 'None' %}
+                            <span class="badge badge-warning">限额: {{ sub.spending_limit }}</span>
+                        {% endif %}
+                    </td>
+                    <td id="sub-cost-{{ sub.id }}" class="table-number">
+                        <span style="color: var(--text-muted); font-size: 0.85rem;">正在查询...</span>
+                    </td>
+                    <td class="table-actions">
+                        <a href="{{ url_for('vms_page', sub_id=sub.id) }}" class="btn btn-outline btn-sm">查看实例</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+</div>
+{% endblock %}

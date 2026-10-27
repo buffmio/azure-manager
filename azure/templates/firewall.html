@@ -1,0 +1,351 @@
+{% extends 'base.html' %}
+{% block title %}{{ nsg_name }} 防火墙规则{% endblock %}
+
+{% block content %}
+<div class="firewall-page">
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; flex-wrap: wrap; gap: 0.75rem;">
+    <div>
+        <div style="display: flex; align-items: center; gap: 0.5rem;">
+            <h2 style="font-size: 1.35rem; font-weight: 700; margin-bottom: 0;">网络安全组 (NSG) 防火墙</h2>
+            <span class="badge badge-primary">{{ nsg_name }}</span>
+        </div>
+        <span style="color: var(--text-muted); font-size: 0.85rem;">
+            订阅: <strong>{{ subscription.display_name }}</strong> | 资源组: <code>{{ resource_group }}</code>
+        </span>
+    </div>
+    {% if vm_name %}
+    <a href="{{ url_for('vm_detail', sub_id=subscription.id, resource_group=resource_group, vm_name=vm_name) }}" class="btn btn-outline btn-sm">&larr; 返回虚拟机详情</a>
+    {% else %}
+    <a href="{{ url_for('vms_page', sub_id=subscription.id) }}" class="btn btn-outline btn-sm">&larr; 返回实例列表</a>
+    {% endif %}
+</div>
+
+{% if error_msg %}
+<div class="alert alert-danger">
+    拉取防火墙规则失败: {{ error_msg }}
+</div>
+{% endif %}
+
+<!-- 现有入站安全规则列表 -->
+<div class="card">
+    <div class="card-title">
+        <span>当前入站安全规则 (Inbound Security Rules)</span>
+        <button type="button" class="btn btn-primary btn-sm" onclick="openAddRuleModal()">添加规则</button>
+    </div>
+
+    <div class="table-responsive">
+        <table class="table firewall-rules-table">
+            <thead>
+                <tr>
+                    <th>优先级 (Priority)</th>
+                    <th class="table-id">规则名称</th>
+                    <th>协议</th>
+                    <th>目标端口</th>
+                    <th>源 IP / CIDR</th>
+                    <th class="table-status">动作 (Action)</th>
+                    <th class="table-actions">操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in rules %}
+                <tr>
+                    <td><strong>{{ r.priority }}</strong></td>
+                    <td class="table-id"><code>{{ r.name }}</code></td>
+                    <td><span class="badge badge-secondary">{{ r.protocol }}</span></td>
+                    <td><code style="color: var(--primary); font-weight: 600;">{{ r.destination_port_range }}</code></td>
+                    <td>{{ r.source_address_prefix }}</td>
+                    <td class="table-status">
+                        {% if r.access == 'Allow' %}
+                            <span class="badge badge-success">放行 Allow</span>
+                        {% else %}
+                            <span class="badge badge-danger">拒绝 Deny</span>
+                        {% endif %}
+                    </td>
+                    <td class="table-actions">
+                        <button type="button" class="btn btn-outline btn-xs" data-rule-edit
+                                data-rule-name="{{ r.name|e }}"
+                                data-rule-priority="{{ r.priority }}"
+                                data-rule-protocol="{{ r.protocol }}"
+                                data-rule-port="{{ r.destination_port_range|e }}"
+                                data-rule-source="{{ r.source_address_prefix|e }}"
+                                data-rule-access="{{ r.access }}">修改</button>
+                        <button type="button" class="btn btn-danger btn-xs" data-rule-delete data-rule-name="{{ r.name|e }}">删除</button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- 添加/修改规则弹窗；协议和动作使用站内统一下拉控件 -->
+<div id="rule-editor-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content firewall-rule-modal-content">
+        <div class="modal-header">
+            <div class="modal-title" id="rule-editor-title">添加入站安全规则</div>
+            <button type="button" class="modal-close" onclick="closeModal('rule-editor-modal')">&times;</button>
+        </div>
+        <form method="post" id="rule-editor-form">
+        <input type="hidden" name="action" id="rule-editor-action" value="add_rule">
+        <div class="firewall-rule-form-grid">
+            <div class="form-group">
+                <label class="form-label">规则名称</label>
+                <input type="text" name="rule_name" id="rule-editor-name" class="form-control" placeholder="Allow-HTTP" required>
+            </div>
+            <div class="form-group">
+                <label class="form-label">目标端口 (如 80 或 8000-8080 或 *)</label>
+                <input type="text" name="port_range" id="rule-editor-port" class="form-control" placeholder="80" required>
+            </div>
+            <div class="form-group">
+                <label class="form-label">协议</label>
+                <select name="protocol" id="rule-editor-protocol" class="form-control">
+                    <option value="Tcp">TCP</option>
+                    <option value="Udp">UDP</option>
+                    <option value="*">Any (*)</option>
+                    <option value="Icmp">ICMP</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">优先级 Priority (100 - 4096)</label>
+                <input type="number" name="priority" id="rule-editor-priority" class="form-control" value="1050" min="100" max="4096" required>
+            </div>
+            <div class="form-group">
+                <label class="form-label">源 IP / CIDR</label>
+                <input type="text" name="source_cidr" id="rule-editor-source" class="form-control" value="*" required>
+            </div>
+            <div class="form-group">
+                <label class="form-label">动作</label>
+                <select name="access" id="rule-editor-access" class="form-control">
+                    <option value="Allow">放行 (Allow)</option>
+                    <option value="Deny">拒绝 (Deny)</option>
+                </select>
+            </div>
+        </div>
+        <div class="firewall-rule-modal-actions">
+            <button type="button" class="btn btn-outline" onclick="closeModal('rule-editor-modal')">取消</button>
+            <button type="submit" id="rule-editor-submit" class="btn btn-primary">保存规则</button>
+        </div>
+        </form>
+    </div>
+</div>
+
+<!-- 删除规则模态弹窗 -->
+<div id="delete-rule-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 480px;">
+        <div class="modal-header">
+            <div class="modal-title" style="color: var(--danger);">删除防火墙规则</div>
+            <button type="button" class="modal-close" onclick="closeModal('delete-rule-modal')">&times;</button>
+        </div>
+        <div style="font-size: 0.9rem; color: var(--text-main); margin-bottom: 1rem;">
+            确定要删除防火墙入站规则 <strong id="delete-rule-target-name"></strong> 吗？
+        </div>
+        <form method="post" id="delete-rule-form">
+            <input type="hidden" name="action" value="delete_rule">
+            <input type="hidden" name="rule_name" id="delete-rule-input" value="">
+            <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+                <button type="button" class="btn btn-outline" onclick="closeModal('delete-rule-modal')">取消</button>
+                <button type="submit" id="delete-rule-btn" class="btn btn-danger">确认删除</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+</div>
+
+<script>
+function openDeleteRuleModal(ruleName) {
+    document.getElementById('delete-rule-target-name').textContent = ruleName;
+    document.getElementById('delete-rule-input').value = ruleName;
+    openModal('delete-rule-modal');
+}
+
+function openAddRuleModal() {
+    const form = document.getElementById('rule-editor-form');
+    form.reset();
+    document.getElementById('rule-editor-action').value = 'add_rule';
+    document.getElementById('rule-editor-name').readOnly = false;
+    document.getElementById('rule-editor-title').textContent = '添加入站安全规则';
+    document.getElementById('rule-editor-submit').textContent = '保存规则';
+    openModal('rule-editor-modal');
+}
+
+function openEditRuleModal(rule) {
+    document.getElementById('rule-editor-action').value = 'update_rule';
+    document.getElementById('rule-editor-name').value = rule.name;
+    document.getElementById('rule-editor-name').readOnly = true;
+    document.getElementById('rule-editor-port').value = rule.port;
+    document.getElementById('rule-editor-priority').value = rule.priority;
+    document.getElementById('rule-editor-source').value = rule.source;
+    document.getElementById('rule-editor-protocol').value = rule.protocol === 'Any (*)' ? '*' : rule.protocol;
+    document.getElementById('rule-editor-access').value = rule.access;
+    document.getElementById('rule-editor-title').textContent = `修改防火墙规则：${rule.name}`;
+    document.getElementById('rule-editor-submit').textContent = '保存修改';
+    openModal('rule-editor-modal');
+}
+
+function setFirewallActionsBusy(busy, activeRuleName = '') {
+    document.querySelectorAll("#rule-editor-submit, #delete-rule-btn").forEach(btn => {
+        const isDelete = btn.id === "delete-rule-btn";
+        setButtonBusy(btn, busy, isDelete ? "删除中..." : "保存中...", isDelete ? "确认删除" : "保存规则");
+    });
+    document.querySelectorAll("[data-rule-delete]").forEach(btn => {
+        if (!busy) {
+            setButtonBusy(btn, false, "", "删除");
+            return;
+        }
+        if (activeRuleName && btn.dataset.ruleName === activeRuleName) {
+            setButtonBusy(btn, true, "删除中...", null);
+        }
+    });
+}
+
+function finishFirewallTask(success, task) {
+    if (success) {
+        sessionStorage.setItem("pending_top_alert", JSON.stringify({ msg: (task && task.progress_msg) || "防火墙操作已完成。", type: "success" }));
+        location.reload();
+        return;
+    }
+    setFirewallActionsBusy(false);
+    showTopAlert((task && (task.error_detail || task.progress_msg)) || "防火墙操作失败。", "danger");
+}
+
+function readFirewallResponse(response) {
+    return response.text().then(text => {
+        let data = {};
+        try { data = text ? JSON.parse(text) : {}; }
+        catch (e) { data = { message: response.status === 401 ? '登录已过期，请重新登录' : `接口返回了无效响应（HTTP ${response.status}）` }; }
+        if (!response.ok && !data.message) data.message = `请求失败（HTTP ${response.status}）`;
+        return data;
+    });
+}
+
+function checkAndRestoreFirewallTasks() {
+    fetch("/api/tasks/list", { cache: "no-store" })
+        .then(readFirewallResponse)
+        .then(data => {
+            const currentSubId = Number('{{ subscription.id }}');
+            const tasks = (data.tasks || []).filter(t =>
+                t.subscription_id === currentSubId &&
+                t.resource_group === '{{ resource_group }}' &&
+                (t.task_type === "firewall_add" || t.task_type === "firewall_update" || t.task_type === "firewall_delete") &&
+                t.target_name === "{{ nsg_name }}" &&
+                (t.status === "InProgress" || t.status === "Pending")
+            );
+            tasks.forEach(t => {
+                setFirewallActionsBusy(true, t.rule_name || '');
+                startWatchingTask(t.target_name || "防火墙", t.task_type, t.id, finishFirewallTask, false);
+            });
+        })
+        .catch(err => console.error("Restore firewall tasks error:", err));
+}
+
+// 添加/修改入站规则
+document.getElementById('rule-editor-form').addEventListener('submit', function(e) {
+    e.preventDefault();
+    const btn = document.getElementById('rule-editor-submit');
+    btn.disabled = true;
+    setFirewallActionsBusy(true);
+    const isUpdate = document.getElementById('rule-editor-action').value === 'update_rule';
+    showTopAlert(`已开始${isUpdate ? '修改' : '添加'}防火墙规则，进度可在活动通知查看。`, "info");
+
+    const formData = new FormData(this);
+    fetch(window.location.href, {
+        method: 'POST',
+        body: formData,
+        headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRF-Token': '{{ csrf_token }}' }
+    })
+    .then(res => readFirewallResponse(res).then(data => ({ ok: res.ok, data })))
+    .then(({ ok, data }) => {
+        if (data.task_id) {
+            startWatchingTask(data.target_name || data.nsg_name || "防火墙", data.task_type || "firewall", data.task_id, finishFirewallTask, false);
+            return;
+        }
+        if (ok && data.status === 'success') {
+            sessionStorage.setItem('pending_top_alert', JSON.stringify({
+                msg: `防火墙安全规则【${data.rule_name || ''}】已成功提交至安全组【${data.nsg_name || ''}】！`,
+                type: 'success'
+            }));
+            location.reload();
+        } else {
+            setFirewallActionsBusy(false);
+            showTopAlert(`防火墙安全规则${isUpdate ? '修改' : '添加'}失败：${data.message || '未知错误'}`, 'danger');
+        }
+    })
+    .catch(err => {
+        setFirewallActionsBusy(false);
+        showTopAlert(`防火墙安全规则${isUpdate ? '修改' : '添加'}失败：${err.message || '网络连接超时'}`, 'danger');
+    });
+});
+
+// 删除规则 (纯原地极速删除，不弹抽屉)
+document.getElementById('delete-rule-form').addEventListener('submit', function(e) {
+    e.preventDefault();
+    const btn = document.getElementById('delete-rule-btn');
+    btn.disabled = true;
+    const activeRuleName = document.getElementById('delete-rule-input').value;
+    setFirewallActionsBusy(true, activeRuleName);
+    showTopAlert("已开始删除防火墙规则，进度可在活动通知查看。", "info");
+    setTimeout(() => closeModal('delete-rule-modal'), 120);
+
+    const formData = new FormData(this);
+    fetch(window.location.href, {
+        method: 'POST',
+        body: formData,
+        headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRF-Token': '{{ csrf_token }}' }
+    })
+    .then(res => readFirewallResponse(res).then(data => ({ ok: res.ok, data })))
+    .then(({ ok, data }) => {
+        if (data.task_id) {
+            startWatchingTask(data.target_name || data.nsg_name || "防火墙", data.task_type || "firewall", data.task_id, finishFirewallTask, false);
+            return;
+        }
+        if (ok && data.status === 'success') {
+            sessionStorage.setItem('pending_top_alert', JSON.stringify({
+                msg: `防火墙安全规则【${data.rule_name || ''}】已成功从安全组【${data.nsg_name || ''}】中移除！`,
+                type: 'success'
+            }));
+            location.reload();
+        } else {
+            setFirewallActionsBusy(false);
+            showTopAlert(`防火墙安全规则删除失败：${data.message || '未知错误'}`, 'danger');
+        }
+    })
+    .catch(err => {
+        setFirewallActionsBusy(false);
+        showTopAlert(`防火墙安全规则删除失败：${err.message || '网络连接超时'}`, 'danger');
+    });
+});
+
+// 页面重载后检查是否有已成功的待展示顶部通知
+document.addEventListener('click', function(event) {
+    const editButton = event.target.closest('[data-rule-edit]');
+    if (editButton) {
+        openEditRuleModal({
+            name: editButton.dataset.ruleName,
+            priority: editButton.dataset.rulePriority,
+            protocol: editButton.dataset.ruleProtocol,
+            port: editButton.dataset.rulePort,
+            source: editButton.dataset.ruleSource,
+            access: editButton.dataset.ruleAccess
+        });
+        return;
+    }
+    const button = event.target.closest('[data-rule-delete]');
+    if (button) {
+        openDeleteRuleModal(button.dataset.ruleName);
+    }
+});
+
+window.addEventListener('DOMContentLoaded', () => {
+    checkAndRestoreFirewallTasks();
+    const pending = sessionStorage.getItem('pending_top_alert');
+    if (pending) {
+        sessionStorage.removeItem('pending_top_alert');
+        try {
+            const item = JSON.parse(pending);
+            showTopAlert(item.msg, item.type);
+        } catch (e) {}
+    }
+});
+</script>
+{% endblock %}
