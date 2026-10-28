@@ -33,7 +33,7 @@ from models import (db, User, LoginAttempt, Account, Subscription, SkuCache,
                     VmSkuPriceCache, VmResizeOptionsCache, LocationCache,
                     ImageCache, ScriptTemplate, DeploymentTask, VmCache, VmCacheSnapshot,
                     CostCache, SystemSetting)
-from azure_service import AzureService, PRESET_IMAGES
+from azure_service import AzureRetailPricesRetry, AzureService, PRESET_IMAGES
 from sku_catalog import (
     is_retail_price_compatible,
     monthly_estimate,
@@ -1124,28 +1124,126 @@ def _load_sku_catalog_for_resize(subscription, account, location):
         raise
 
 
-def _enrich_sku_prices(subscription, location, skus, os_type, billing_mode, currency):
-    """按页面维度读取/刷新价格缓存；价格失败不阻断规格列表。"""
+_sku_price_sync_lock = threading.Lock()
+_sku_price_sync_jobs = set()
+
+
+def _sku_price_sync_key(subscription_id, location, os_type, billing_mode, currency, sku_names):
+    return (
+        int(subscription_id),
+        str(location).lower(),
+        str(currency).upper(),
+        tuple(sorted({str(name).lower() for name in sku_names if name})),
+    )
+
+
+def _schedule_sku_price_sync(subscription_id, location, sku_names, os_type, billing_mode, currency):
+    normalized_names = tuple(sorted({str(name) for name in sku_names if name}))
+    key = _sku_price_sync_key(subscription_id, location, os_type, billing_mode, currency, normalized_names)
+    args = (subscription_id, location, normalized_names, os_type, billing_mode, currency)
+    with _sku_price_sync_lock:
+        if key in _sku_price_sync_jobs:
+            return
+        _sku_price_sync_jobs.add(key)
+    try:
+        submit_background_task(_run_sku_price_sync, key, args)
+    except Exception:
+        with _sku_price_sync_lock:
+            _sku_price_sync_jobs.discard(key)
+        logger.exception("价格目录后台任务提交失败：location=%s", location)
+
+
+def _retry_sku_price_sync_later(key, args, delay_seconds):
+    def submit_retry():
+        try:
+            submit_background_task(_run_sku_price_sync, key, args)
+        except Exception:
+            with _sku_price_sync_lock:
+                _sku_price_sync_jobs.discard(key)
+            logger.exception("价格目录后台续取任务提交失败：location=%s", args[1])
+
+    timer = threading.Timer(max(1, int(delay_seconds)), submit_retry)
+    timer.daemon = True
+    timer.start()
+
+
+def _run_sku_price_sync(key, args):
+    subscription_id, location, sku_names, _os_type, _billing_mode, currency = args
+    retry_scheduled = False
+    try:
+        subscription = db.session.get(Subscription, subscription_id)
+        if subscription is None:
+            return
+        skus = [{"name": name} for name in sku_names]
+        # 一次地区目录同步后，在数据库缓存同一地区的 Linux/Windows、
+        # 按需/Spot 组合，避免用户切换选择时重复访问 Retail Prices。
+        for os_type in ("Linux", "Windows"):
+            for billing_mode in ("on_demand", "spot"):
+                _prices, price_error, retry_after_seconds, price_pending = _enrich_sku_prices(
+                    subscription,
+                    location,
+                    skus,
+                    os_type,
+                    billing_mode,
+                    currency,
+                    allow_upstream_fetch=True,
+                )
+                if price_pending:
+                    _retry_sku_price_sync_later(key, args, retry_after_seconds or 60)
+                    retry_scheduled = True
+                    return
+                if price_error:
+                    logger.warning(
+                        "价格目录后台同步失败：location=%s os=%s billing=%s error=%s",
+                        location,
+                        os_type,
+                        billing_mode,
+                        price_error,
+                    )
+    except Exception:
+        db.session.rollback()
+        logger.exception("价格目录后台同步异常：location=%s", location)
+        _retry_sku_price_sync_later(key, args, 60)
+        retry_scheduled = True
+    finally:
+        db.session.remove()
+        # 已安排续取时保留去重键，直到后台同步最终结束。
+        if not retry_scheduled:
+            with _sku_price_sync_lock:
+                _sku_price_sync_jobs.discard(key)
+
+
+def _enrich_sku_prices(subscription, location, skus, os_type, billing_mode, currency,
+                       allow_upstream_fetch=False):
+    """读地区 SKU 价格缓存；缺失项由后台地区快照任务主动补齐。"""
     os_type = "Windows" if str(os_type).lower() == "windows" else "Linux"
     billing_mode = "spot" if str(billing_mode).lower() == "spot" else "on_demand"
     currency = (str(currency or "USD").upper())[:16]
     ttl = timedelta(minutes=20 if billing_mode == "spot" else 360)
     cutoff = datetime.utcnow() - ttl
     names = [item.get("name") for item in skus if item.get("name")]
-    rows = VmSkuPriceCache.query.filter(
-        VmSkuPriceCache.subscription_id == subscription.id,
-        VmSkuPriceCache.location == location,
-        VmSkuPriceCache.os_type == os_type,
-        VmSkuPriceCache.billing_mode == billing_mode,
-        VmSkuPriceCache.currency == currency,
-        VmSkuPriceCache.sku_name.in_(names or [""]),
-    ).all()
+
+    def load_price_rows():
+        rows = []
+        for offset in range(0, len(names), 500):
+            name_batch = names[offset:offset + 500]
+            rows.extend(VmSkuPriceCache.query.filter(
+                VmSkuPriceCache.subscription_id == subscription.id,
+                VmSkuPriceCache.location == location,
+                VmSkuPriceCache.os_type == os_type,
+                VmSkuPriceCache.billing_mode == billing_mode,
+                VmSkuPriceCache.currency == currency,
+                VmSkuPriceCache.sku_name.in_(name_batch),
+            ).all())
+        return rows
+
+    rows = load_price_rows()
     row_by_name = {row.sku_name.lower(): row for row in rows}
 
-    def cached_price_is_usable(row):
-        if not row or not row.updated_at or row.updated_at < cutoff:
+    def cached_price_matches_context(row):
+        if not row or not row.updated_at:
             return False
-        # 没有价格也是有效结果，短期内不应因同一批无报价 SKU 重复请求 Azure。
+        # 没有价格也是有效结果；只有匹配当前 OS/计费方式的结果才可展示。
         if row.hourly_price is None:
             return row.price_type == "unavailable" and bool(row.source)
         if row.monthly_price is None:
@@ -1156,17 +1254,45 @@ def _enrich_sku_prices(subscription, location, skus, os_type, billing_mode, curr
             return False
         return is_retail_price_compatible(payload, os_type, billing_mode)
 
+    def cached_price_is_usable(row):
+        return bool(
+            cached_price_matches_context(row)
+            and row.updated_at >= cutoff
+        )
+
     missing = [name for name in names if not cached_price_is_usable(row_by_name.get(name.lower()))]
     price_error = None
-    if missing:
+    retry_after_seconds = None
+    price_pending = bool(missing)
+    if missing and not allow_upstream_fetch:
+        _schedule_sku_price_sync(
+            subscription.id,
+            location,
+            missing,
+            os_type,
+            billing_mode,
+            currency,
+        )
+        retry_after_seconds = 10
+    elif missing:
         try:
             records = AzureService.fetch_retail_prices(
                 location,
                 currency=currency,
                 sku_names=missing,
             )
+            records_by_sku = {}
+            for record in records:
+                record_sku = str(record.get("armSkuName") or "").lower()
+                if record_sku:
+                    records_by_sku.setdefault(record_sku, []).append(record)
             for name in missing:
-                selected = select_retail_price(records, name, os_type, billing_mode)
+                selected = select_retail_price(
+                    records_by_sku.get(name.lower(), []),
+                    name,
+                    os_type,
+                    billing_mode,
+                )
                 hourly = float(selected["retailPrice"]) if selected else None
                 now = datetime.utcnow()
                 row = row_by_name.get(name.lower())
@@ -1211,33 +1337,47 @@ def _enrich_sku_prices(subscription, location, skus, os_type, billing_mode, curr
                 )
                 db.session.execute(statement)
             db.session.commit()
-            rows = VmSkuPriceCache.query.filter(
-                VmSkuPriceCache.subscription_id == subscription.id,
-                VmSkuPriceCache.location == location,
-                VmSkuPriceCache.os_type == os_type,
-                VmSkuPriceCache.billing_mode == billing_mode,
-                VmSkuPriceCache.currency == currency,
-                VmSkuPriceCache.sku_name.in_(names or [""]),
-            ).all()
+            rows = load_price_rows()
             row_by_name = {row.sku_name.lower(): row for row in rows}
+            price_pending = False
+        except AzureRetailPricesRetry as exc:
+            db.session.rollback()
+            price_error = (
+                "价格目录分页较慢，后台将继续获取"
+                if exc.reason == "timeout"
+                else "Azure 价格接口限流，等待冷却后重试"
+            )
+            retry_after_seconds = exc.retry_after_seconds
+            logger.info(
+                "Azure 价格目录暂不可用（%s），建议 %s 秒后续取",
+                exc.reason,
+                retry_after_seconds,
+            )
         except Exception as exc:
             db.session.rollback()
             price_error = "价格暂时无法获取"
+            retry_after_seconds = 60
             logger.warning("Azure 价格缓存刷新失败：%s", exc)
 
     enriched = []
     for item in skus:
         copy = dict(item)
         row = row_by_name.get(str(item.get("name") or "").lower())
+        current_row = row if cached_price_is_usable(row) else None
+        price_status = "ready" if current_row else "pending"
         copy.update({
-            "hourly_price": row.hourly_price if row else None,
-            "monthly_price": row.monthly_price if row else None,
+            "hourly_price": current_row.hourly_price if current_row else None,
+            "monthly_price": current_row.monthly_price if current_row else None,
             "currency": currency,
             "billing_mode": billing_mode,
-            "price_updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
+            "price_updated_at": (
+                current_row.updated_at.replace(tzinfo=timezone.utc).isoformat()
+                if current_row and current_row.updated_at else None
+            ),
+            "price_status": price_status,
         })
         enriched.append(copy)
-    return enriched, price_error
+    return enriched, price_error, retry_after_seconds, price_pending
 
 TASK_TIMEOUT_SECONDS = {"create": 3600, "reinstall": 3600, "resize": 3600, "change_ip": 1800, "sync_costs": 1200, "sync_subscriptions": 1200, "reset_credentials": 1800}
 DEFAULT_TASK_TIMEOUT_SECONDS = 1800
@@ -3725,13 +3865,14 @@ def api_get_skus(sub_id, location):
 @app.route("/api/sub/<int:sub_id>/sku_prices/<location>")
 @login_required
 def api_get_sku_prices(sub_id, location):
-    """只刷新价格字段，避免切换计费模式时重新传输和渲染规格目录。"""
+    """读取地区规格的本地价格快照；首次或过期时在后台主动刷新。"""
     subscription = Subscription.query.get_or_404(sub_id)
     account = subscription.account
     loc = location.lower().replace(" ", "")
     os_type = "Windows" if request.args.get("os_type", "Linux").lower() == "windows" else "Linux"
     billing_mode = "spot" if request.args.get("billing_mode", "on_demand").lower() == "spot" else "on_demand"
     currency = request.args.get("currency", "USD")
+    sku_name = str(request.args.get("sku_name", "")).strip()
 
     cached = SkuCache.query.filter(
         SkuCache.subscription_id == subscription.id,
@@ -3790,11 +3931,21 @@ def api_get_sku_prices(sub_id, location):
                 "prices": [],
             })
 
+    if sku_name and sku_name != "*":
+        selected_skus = [
+            item for item in cached
+            if str(item.name or "").lower() == sku_name.lower()
+        ]
+    else:
+        selected_skus = cached
+    if not selected_skus:
+        return jsonify({"status": "error", "message": "该地域没有此规格"}), 404
+
     try:
-        sku_payloads, price_error = _enrich_sku_prices(
+        sku_payloads, price_error, retry_after_seconds, price_pending = _enrich_sku_prices(
             subscription,
             loc,
-            [_sku_cache_payload(item) for item in cached],
+            [_sku_cache_payload(item) for item in selected_skus],
             os_type,
             billing_mode,
             currency,
@@ -3805,12 +3956,15 @@ def api_get_sku_prices(sub_id, location):
             "os_type": os_type,
             "billing_mode": billing_mode,
             "price_error": price_error,
+            "retry_after_seconds": retry_after_seconds,
+            "price_pending": price_pending,
             "prices": [{
                 "name": item.get("name"),
                 "hourly_price": item.get("hourly_price"),
                 "monthly_price": item.get("monthly_price"),
                 "currency": item.get("currency"),
                 "price_updated_at": item.get("price_updated_at"),
+                "price_status": item.get("price_status"),
             } for item in sku_payloads],
         })
     except Exception as error:
@@ -3919,23 +4073,11 @@ def api_vm_resize_options(sub_id, resource_group, vm_name):
             resize_cache.updated_at = datetime.utcnow()
             db.session.commit()
 
-        # 规格目录与价格是独立缓存维度。无论命中哪一层规格缓存，
-        # 都必须从价格缓存重新关联，避免把旧的错误价格随规格缓存返回。
-        if options.get("location") and options.get("sizes"):
-            priced_sizes, price_error = _enrich_sku_prices(
-                subscription,
-                options["location"],
-                options["sizes"],
-                options.get("current_os_type", "Linux"),
-                options.get("current_billing_mode", "on_demand"),
-                request.args.get("currency", "USD"),
-            )
-            options["sizes"] = priced_sizes
-            options["price_error"] = price_error
         return jsonify({
             "status": "success",
             "source": options.get("source"),
             "cached_at": options.get("cached_at"),
+            "location": options.get("location"),
             "current_size": options.get("current_size"),
             "power_state": options.get("power_state"),
             "supported": options.get("supported", False),
@@ -3944,7 +4086,6 @@ def api_vm_resize_options(sub_id, resource_group, vm_name):
             "current_nic_accelerated_networking": options.get("current_nic_accelerated_networking"),
             "current_os_type": options.get("current_os_type"),
             "current_billing_mode": options.get("current_billing_mode"),
-            "price_error": options.get("price_error"),
             "sizes": options.get("sizes", []),
         })
     except Exception as error:

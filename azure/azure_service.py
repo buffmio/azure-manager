@@ -4,10 +4,12 @@ import time
 import base64
 import hashlib
 import logging
+import math
 import threading
 import uuid
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import List, Dict, Any, Optional
 
 from azure.identity import ClientSecretCredential
@@ -34,6 +36,29 @@ except ImportError:
 logger = logging.getLogger("azure_service")
 
 
+def _retail_prices_retry_delay(value: str, fallback: float) -> float:
+    """解析 Azure 的 Retry-After 秒数或 HTTP 日期。"""
+    try:
+        return max(float(value), 0.5)
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max((retry_at - datetime.now(timezone.utc)).total_seconds(), 0.5)
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+
+
+class AzureRetailPricesRetry(RuntimeError):
+    """Retail Prices 暂时不可用，携带建议的下一次重试等待秒数。"""
+
+    def __init__(self, retry_after_seconds: int, reason: str):
+        self.retry_after_seconds = max(1, int(retry_after_seconds))
+        self.reason = reason
+        super().__init__("Azure Retail Prices 暂时不可用")
+
+
 def _resolve_azure_timeout():
     try:
         value = int(os.getenv("AZURE_OPERATION_TIMEOUT_SECONDS", "1800"))
@@ -45,7 +70,10 @@ def _resolve_azure_timeout():
 AZURE_OPERATION_TIMEOUT_SECONDS = _resolve_azure_timeout()
 VM_RESIZE_OPTIONS_CACHE_TTL_SECONDS = 60
 RETAIL_PRICES_CACHE_TTL_SECONDS = 6 * 60 * 60
-RETAIL_PRICES_TOTAL_TIMEOUT_SECONDS = 20
+# East Asia 的完整 VM 价格快照实测需约 20 秒；保留硬超时并为分页耗时波动留出空间。
+RETAIL_PRICES_TOTAL_TIMEOUT_SECONDS = 60
+RETAIL_PRICES_RATE_LIMIT_COOLDOWN_SECONDS = 60
+RETAIL_PRICES_TIMEOUT_RETRY_SECONDS = 30
 AZURE_RETAIL_PRICES_URL = "https://prices.azure.com/api/retail/prices"
 RESOURCE_PROVIDER_REGISTRATION_TIMEOUT_SECONDS = 300
 RESOURCE_PROVIDER_STATUS_CACHE_TTL_SECONDS = 300
@@ -178,8 +206,10 @@ class AzureService:
     _resize_options_cache = {}
     _resize_options_cache_lock = threading.Lock()
     _retail_prices_cache = {}
-    _retail_prices_cache_locks = {}
     _retail_prices_cache_lock = threading.Lock()
+    # Retail Prices 的限流可能跨地域生效，进程内统一串行并使用全局冷却。
+    _retail_prices_fetch_lock = threading.Lock()
+    _retail_prices_rate_limited_until = 0.0
     _resource_provider_status_cache = {}
     _resource_provider_registration_lock = threading.Lock()
 
@@ -384,9 +414,8 @@ class AzureService:
     @staticmethod
     def _retail_price_filter(location: str, sku_names=None) -> str:
         escaped_location = str(location).strip().lower().replace("'", "''")
-        # Retail Prices API 不接受多个 armSkuName 的 OR 组合过滤。
-        # 一次拉取指定地域的 Virtual Machines Consumption 目录，随后在本地
-        # 按 SKU、系统和计费模式选择，并由进程缓存复用目录结果。
+        # Retail Prices API 不接受多个 armSkuName 的 OR 组合过滤；调用端
+        # 只请求当前选中的单个 SKU，避免下载整个地域的 VM 价格目录。
         price_filter = (
             "serviceName eq 'Virtual Machines' and "
             "priceType eq 'Consumption' and "
@@ -401,56 +430,140 @@ class AzureService:
     @classmethod
     def fetch_retail_prices(cls, location: str, currency: str = "USD",
                             sku_names=None) -> List[Dict[str, Any]]:
-        """按地域读取 Azure Retail Prices 目录，并按请求 SKU 在本地筛选。"""
+        """按地域和请求 SKU 读取 Azure Retail Prices，并缓存分页结果。"""
         normalized_location = str(location).strip().lower().replace(" ", "")
         normalized_currency = str(currency or "USD").upper()
         requested_names = tuple(sorted({str(name).strip().lower() for name in (sku_names or []) if str(name).strip()}))
         cache_scope = requested_names[0] if len(requested_names) == 1 else "region"
         cache_key = (normalized_location, normalized_currency, cache_scope)
-        with cls._retail_prices_cache_lock:
-            fetch_lock = cls._retail_prices_cache_locks.setdefault(cache_key, threading.Lock())
-
-        with fetch_lock:
+        with cls._retail_prices_fetch_lock:
             now = time.monotonic()
             with cls._retail_prices_cache_lock:
                 cached = cls._retail_prices_cache.get(cache_key)
-            if cached and now - cached[0] < RETAIL_PRICES_CACHE_TTL_SECONDS:
-                return [dict(item) for item in cached[1]]
+            if cached and cached["complete"] and now - cached["fetched_at"] < RETAIL_PRICES_CACHE_TTL_SECONDS:
+                return [dict(item) for item in cached["records"]]
+            with cls._retail_prices_cache_lock:
+                rate_limited_until = cls._retail_prices_rate_limited_until
+            if now < rate_limited_until:
+                raise AzureRetailPricesRetry(math.ceil(rate_limited_until - now), "rate_limited")
 
-            url = AZURE_RETAIL_PRICES_URL
-            params = {
-                "api-version": "2023-01-01-preview",
-                "currencyCode": normalized_currency,
-                "$filter": cls._retail_price_filter(
-                    normalized_location,
-                    sku_names=sku_names,
-                ),
-            }
-            records = []
-            deadline = time.monotonic() + RETAIL_PRICES_TOTAL_TIMEOUT_SECONDS
+            if cached and not cached["complete"]:
+                records = [dict(item) for item in cached["records"]]
+                url = cached["next_url"]
+                params = cached["next_params"]
+            else:
+                url = AZURE_RETAIL_PRICES_URL
+                params = {
+                    "api-version": "2023-01-01-preview",
+                    "currencyCode": normalized_currency,
+                    # 2023 preview 默认同时返回 primary/non-primary meter，
+                    # 会扩大结果集和分页量；VM 公开计价只取 primary meter。
+                    "meterRegion": "'primary'",
+                    "$filter": cls._retail_price_filter(
+                        normalized_location,
+                        sku_names=sku_names,
+                    ),
+                }
+                records = []
+
+            def save_partial(next_url, next_params):
+                with cls._retail_prices_cache_lock:
+                    cls._retail_prices_cache[cache_key] = {
+                        "fetched_at": time.monotonic(),
+                        "records": [dict(item) for item in records],
+                        "complete": False,
+                        "next_url": next_url,
+                        "next_params": next_params,
+                    }
+
+            started_at = time.monotonic()
+            deadline = started_at + RETAIL_PRICES_TOTAL_TIMEOUT_SECONDS
+            page_count = 0
             while url:
                 response = None
+                retry_delay = 1.0
                 for attempt in range(3):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise TimeoutError("Azure Retail Prices 请求超时")
-                    response = requests.get(url, params=params, timeout=min(30, remaining))
-                    if response.status_code != 429 or attempt == 2:
+                        save_partial(url, params)
+                        cooldown = RETAIL_PRICES_TIMEOUT_RETRY_SECONDS
+                        logger.warning(
+                            "Retail Prices 分页总耗时超时：region=%s pages=%s records=%s elapsed=%.2fs retry_in=%ss",
+                            normalized_location,
+                            page_count,
+                            len(records),
+                            time.monotonic() - started_at,
+                            cooldown,
+                        )
+                        raise AzureRetailPricesRetry(cooldown, "timeout")
+                    try:
+                        response = requests.get(url, params=params, timeout=min(30, remaining))
+                    except requests.exceptions.Timeout as exc:
+                        save_partial(url, params)
+                        cooldown = RETAIL_PRICES_TIMEOUT_RETRY_SECONDS
+                        logger.warning(
+                            "Retail Prices 单页请求超时：region=%s pages=%s records=%s elapsed=%.2fs retry_in=%ss",
+                            normalized_location,
+                            page_count,
+                            len(records),
+                            time.monotonic() - started_at,
+                            cooldown,
+                        )
+                        raise AzureRetailPricesRetry(cooldown, "timeout") from exc
+                    if response.status_code != 429:
                         break
                     retry_after = response.headers.get("Retry-After", "1")
-                    try:
-                        delay = min(max(float(retry_after), 0.5), 5.0)
-                    except (TypeError, ValueError):
-                        delay = 1.0
-                    time.sleep(min(delay, max(0, deadline - time.monotonic())))
+                    retry_delay = _retail_prices_retry_delay(retry_after, float(attempt + 1))
+                    if attempt == 2:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if retry_delay >= remaining:
+                        break
+                    time.sleep(retry_delay)
+                if response is not None and response.status_code == 429:
+                    cooldown = max(retry_delay, RETAIL_PRICES_RATE_LIMIT_COOLDOWN_SECONDS)
+                    rate_limited_until = time.monotonic() + cooldown
+                    with cls._retail_prices_cache_lock:
+                        cls._retail_prices_rate_limited_until = max(
+                            cls._retail_prices_rate_limited_until,
+                            rate_limited_until,
+                        )
+                    save_partial(url, params)
+                    logger.warning(
+                        "Retail Prices 返回 HTTP 429：region=%s pages=%s records=%s retry_after=%s cooldown=%ss request_id=%s azure_ref=%s",
+                        normalized_location,
+                        page_count,
+                        len(records),
+                        response.headers.get("Retry-After"),
+                        math.ceil(cooldown),
+                        response.headers.get("x-ms-request-id"),
+                        response.headers.get("x-azure-ref"),
+                    )
+                    raise AzureRetailPricesRetry(math.ceil(cooldown), "rate_limited")
                 response.raise_for_status()
                 payload = response.json() or {}
                 records.extend(payload.get("Items") or payload.get("items") or [])
+                page_count += 1
                 url = payload.get("NextPageLink") or payload.get("nextPageLink")
                 params = None  # NextPageLink 已包含分页参数，不能重复拼接筛选器。
+                if url:
+                    save_partial(url, params)
 
             with cls._retail_prices_cache_lock:
-                cls._retail_prices_cache[cache_key] = (time.monotonic(), records)
+                cls._retail_prices_cache[cache_key] = {
+                    "fetched_at": time.monotonic(),
+                    "records": [dict(item) for item in records],
+                    "complete": True,
+                    "next_url": None,
+                    "next_params": None,
+                }
+            logger.info(
+                "Retail Prices 分页获取完成：region=%s pages=%s records=%s elapsed=%.2fs",
+                normalized_location,
+                page_count,
+                len(records),
+                time.monotonic() - started_at,
+            )
             return [dict(item) for item in records]
 
     # 镜像缓存由 Flask 接口持久化到 ImageCache，服务层始终负责动态探测

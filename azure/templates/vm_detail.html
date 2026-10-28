@@ -565,6 +565,11 @@ function bindAllModalForms() {
 let resizeOptionsRequest = null;
 let resizeOptionsReady = false;
 let resizeOptionsCachedAt = 0;
+let resizePriceContext = null;
+let resizePriceRequests = Object.create(null);
+let resizePriceRetryTimers = Object.create(null);
+let resizePriceExpiryTimers = Object.create(null);
+let resizeSizesByName = Object.create(null);
 const RESIZE_OPTIONS_CACHE_TTL_MS = 60 * 1000;
 
 function formatResizeSizeMb(value) {
@@ -609,10 +614,20 @@ function hasPublicMonthlyPrice(size) {
     return Number.isFinite(Number(value));
 }
 
+function formatResizePriceUpdatedAt(value) {
+    if (!value) return '更新时间未知';
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN');
+}
+
 function formatMonthlyPrice(size) {
+    if (size?.price_status === 'loading') return '价格查询中...';
+    if (size?.price_status === 'error') return '价格暂时无法获取';
+    if (size?.price_status === 'pending') return '价格同步中';
+    if (size?.price_status === 'stale') return '过期价格已隐藏，正在更新';
     const value = size?.monthly_price;
     if (value === null || value === undefined || value === '' || !Number.isFinite(Number(value))) {
-        return 'Azure 未提供公开价格（不代表免费）';
+        return size?.price_status === 'ready' ? NO_PUBLIC_PRICE_LABEL : '选中后查询价格';
     }
     const numeric = Number(value);
     return Number.isFinite(numeric)
@@ -636,7 +651,11 @@ function formatResizeSizeDetails(size) {
         `Hyper-V：${(size.hyperv_generations || []).join('、') || '-'}`,
         `可用区：${(size.availability_zones || []).join('、') || '-'}`,
     ];
-    if (!hasPublicMonthlyPrice(size)) details.push(NO_PUBLIC_PRICE_DETAIL);
+    if (size?.price_status === 'loading') details.push('价格查询中，请稍候');
+    else if (size?.price_status === 'pending') details.push('当前地区价格正在后台缓存；已有价格可继续使用');
+    else if (size?.price_status === 'stale') details.push('过期价格已隐藏，后台正在重新获取');
+    else if (size?.price_status === 'error') details.push('价格暂时无法获取；不影响规格可用性判断');
+    else if (size?.price_status === 'ready' && !hasPublicMonthlyPrice(size)) details.push(NO_PUBLIC_PRICE_DETAIL);
     if (size.restriction_reasons && size.restriction_reasons.length) {
         const labels = size.restriction_reasons.map(reason => ({
             TrustedLaunchUnsupported: '不支持 Trusted Launch',
@@ -646,6 +665,95 @@ function formatResizeSizeDetails(size) {
     }
     if (size.display_only) details.push('仅用于显示，Azure 当前未将其列入本机可调整集合');
     return details.join('；');
+}
+
+function renderResizePriceForSize(sizeName) {
+    const size = resizeSizesByName[String(sizeName || '').toLowerCase()];
+    if (!size) return;
+    const select = document.getElementById('resize-size-select');
+    const option = Array.from(select?.options || []).find(item => item.value === size.name);
+    if (option) option.textContent = formatResizeSizeLabel(size, '');
+    const item = Array.from(document.querySelectorAll('#resize-size-dropdown-menu [data-size-name]'))
+        .find(element => element.dataset.sizeName.toLowerCase() === size.name.toLowerCase());
+    if (item) {
+        item.textContent = formatResizeSizeLabel(size, '');
+        item.title = formatResizeSizeDetails(size);
+    }
+    const label = document.getElementById('resize-size-dropdown-label');
+    if (select?.value?.toLowerCase() === size.name.toLowerCase() && label) {
+        label.textContent = formatResizeSizeLabel(size, '');
+    }
+}
+
+function loadResizePriceSnapshot(retryAttempt = 0) {
+    if (!resizePriceContext?.location) return Promise.resolve();
+    const context = resizePriceContext;
+    const key = `${context.location}|${context.osType}|${context.billingMode}|*`.toLowerCase();
+    if (resizePriceRequests[key]) return resizePriceRequests[key];
+
+    const url = `/api/sub/${VM_DETAIL_SUB_ID}/sku_prices/${encodeURIComponent(context.location)}?os_type=${encodeURIComponent(context.osType)}&billing_mode=${encodeURIComponent(context.billingMode)}&sku_name=*`;
+    const request = fetch(url, { cache: 'no-store' })
+        .then(response => response.json().then(data => {
+            if (!response.ok || data.status !== 'success') throw new Error(data.message || '读取规格价格失败');
+            (data.prices || []).forEach(price => {
+                const size = resizeSizesByName[String(price.name || '').toLowerCase()];
+                if (!size) return;
+                const expired = price.price_status === 'stale';
+                Object.assign(size, price, {
+                    hourly_price: expired ? null : price.hourly_price,
+                    monthly_price: expired ? null : price.monthly_price,
+                    price_updated_at: expired ? null : price.price_updated_at,
+                    price_status: expired ? 'pending' : (price.price_status || 'ready'),
+                });
+                renderResizePriceForSize(size.name);
+            });
+            scheduleResizePriceExpiry(context, data.prices || []);
+            if (data.price_pending && retryAttempt < 120 && !resizePriceRetryTimers[key]) {
+                const delay = Math.max(5, Number(data.retry_after_seconds) || 5) * 1000;
+                resizePriceRetryTimers[key] = setTimeout(() => {
+                    delete resizePriceRetryTimers[key];
+                    loadResizePriceSnapshot(retryAttempt + 1);
+                }, delay);
+            }
+        }))
+        .catch(() => {
+            // 保留已有价格；后台快照失败不影响规格选择。
+        })
+        .finally(() => {
+            delete resizePriceRequests[key];
+        });
+    resizePriceRequests[key] = request;
+    return request;
+}
+
+function scheduleResizePriceExpiry(context, prices) {
+    const key = `${context.location}|${context.osType}|${context.billingMode}|*`.toLowerCase();
+    clearTimeout(resizePriceExpiryTimers[key]);
+    delete resizePriceExpiryTimers[key];
+    const ttl = context.billingMode === 'spot' ? 20 * 60 * 1000 : 6 * 60 * 60 * 1000;
+    const expiries = (prices || [])
+        .map(price => Date.parse(price.price_updated_at))
+        .filter(timestamp => Number.isFinite(timestamp))
+        .map(timestamp => timestamp + ttl);
+    if (!expiries.length) return;
+
+    resizePriceExpiryTimers[key] = setTimeout(() => {
+        delete resizePriceExpiryTimers[key];
+        const activeKey = `${resizePriceContext?.location}|${resizePriceContext?.osType}|${resizePriceContext?.billingMode}|*`.toLowerCase();
+        if (activeKey !== key) return;
+        const now = Date.now();
+        Object.values(resizeSizesByName).forEach(size => {
+            const updatedAt = Date.parse(size.price_updated_at || '');
+            if (Number.isFinite(updatedAt) && now - updatedAt < ttl) return;
+            size.hourly_price = null;
+            size.monthly_price = null;
+            size.price_updated_at = null;
+            size.price_status = 'pending';
+            renderResizePriceForSize(size.name);
+        });
+        const modal = document.getElementById('resize-vm-modal');
+        if (modal?.classList.contains('show')) loadResizePriceSnapshot();
+    }, Math.max(0, Math.min(...expiries) - Date.now()));
 }
 
 function toggleResizeDropdown(event) {
@@ -717,6 +825,11 @@ function openResizeModal() {
         .then(data => {
             const serverCachedAt = Number(data.cached_at);
             resizeOptionsCachedAt = serverCachedAt > 0 ? serverCachedAt * 1000 : Date.now();
+            resizePriceContext = {
+                location: data.location || '',
+                osType: data.current_os_type || 'Linux',
+                billingMode: data.current_billing_mode || 'on_demand',
+            };
             if (!data.supported) {
                 if (errorBox) {
                     errorBox.textContent = data.unsupported_reason || '当前虚拟机不支持调整规格';
@@ -734,32 +847,26 @@ function openResizeModal() {
 
             const sizes = Array.isArray(data.sizes) ? data.sizes : [];
             const currentSize = data.current_size || '';
+            resizeSizesByName = Object.create(null);
+            sizes.forEach(size => {
+                size.price_status = hasPublicMonthlyPrice(size) ? 'ready' : 'pending';
+                resizeSizesByName[String(size.name || '').toLowerCase()] = size;
+            });
             const targetSizes = sizes.filter(size =>
                 size.name
                 && size.name.toLowerCase() !== currentSize.toLowerCase()
                 && size.selectable !== false
-                && hasPublicMonthlyPrice(size)
             );
             const hasSelectableTarget = targetSizes.length > 0;
             const hasRestrictedDisplay = sizes.some(size => size.selectable === false);
-            const hasUnpricedTarget = sizes.some(size =>
-                size.name
-                && size.name.toLowerCase() !== currentSize.toLowerCase()
-                && size.selectable !== false
-                && !hasPublicMonthlyPrice(size)
-            );
             if (!hasSelectableTarget) {
                 if (errorBox) {
-                    errorBox.textContent = hasUnpricedTarget
-                        ? (hasRestrictedDisplay
-                            ? '当前没有可选择且有公开价格的目标规格；受限或无公开价格规格不能提交'
-                            : '当前没有可选择且有公开价格的目标规格；无公开价格规格不能提交')
-                        : hasRestrictedDisplay
+                    errorBox.textContent = hasRestrictedDisplay
                         ? '当前没有可选择的目标规格；受限规格仍保留展示，不能提交'
                         : '该虚拟机没有可用的目标规格';
                     errorBox.style.display = 'block';
                 }
-                if (!hasRestrictedDisplay && !hasUnpricedTarget) {
+                if (!hasRestrictedDisplay) {
                     if (select) {
                         select.innerHTML = '';
                         select.disabled = true;
@@ -786,14 +893,14 @@ function openResizeModal() {
                         const isCurrent = size.name.toLowerCase() === currentSize.toLowerCase();
                         option.textContent = formatResizeSizeLabel(size, currentSize);
                         option.selected = isCurrent;
-                        const priceUnavailable = !isCurrent && !hasPublicMonthlyPrice(size);
-                        option.disabled = size.selectable === false || priceUnavailable;
+                        option.disabled = size.selectable === false;
                         select.appendChild(option);
 
                         if (dropdownMenu) {
                             const item = document.createElement('div');
-                            const disabled = size.selectable === false || priceUnavailable;
+                            const disabled = size.selectable === false;
                             item.className = `custom-dropdown-item${isCurrent ? ' selected' : ''}${disabled ? ' disabled' : ''}`;
+                            item.dataset.sizeName = size.name;
                             item.textContent = option.textContent;
                             item.title = formatResizeSizeDetails(size);
                             item.onclick = event => {
@@ -814,9 +921,7 @@ function openResizeModal() {
                 select.disabled = false;
                 setResizeDropdownState(
                     false,
-                    hasSelectableTarget
-                        ? undefined
-                        : (hasRestrictedDisplay ? '仅有受限或无公开价格规格' : '仅有无公开价格规格')
+                    hasSelectableTarget ? undefined : '仅有受限规格'
                 );
                 select.onchange = () => {
                     if (submit) submit.disabled = select.value.toLowerCase() === currentSize.toLowerCase();
@@ -824,6 +929,7 @@ function openResizeModal() {
             }
             if (field) field.style.display = 'block';
             if (submit) submit.disabled = !select || select.value.toLowerCase() === currentSize.toLowerCase();
+            loadResizePriceSnapshot();
             resizeOptionsReady = true;
         })
         .catch(err => {

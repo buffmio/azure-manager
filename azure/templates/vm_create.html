@@ -334,7 +334,9 @@ let skuDataByName = Object.create(null);
 let skuPriceCache = Object.create(null);
 let skuPriceRequests = Object.create(null);
 let skuPriceControllers = Object.create(null);
-let skuPricePrewarmTimer = null;
+let skuPriceRetryTimers = Object.create(null);
+let skuPriceExpiryTimers = Object.create(null);
+let displayedSkuPriceContextKey = '';
 let locationRequestSequence = 0;
 let imageSelectionRequired = false;
 let dynamicImagesReady = false;
@@ -547,12 +549,20 @@ function hasPublicMonthlyPrice(sku) {
     return Number.isFinite(Number(value));
 }
 
+function formatPriceUpdatedAt(value) {
+    if (!value) return '更新时间未知';
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN');
+}
+
 function formatMonthlyPrice(sku) {
     if (sku?.price_status === 'loading') return '价格加载中...';
     if (sku?.price_status === 'error') return '价格暂时无法获取';
+    if (sku?.price_status === 'pending') return '价格同步中';
+    if (sku?.price_status === 'stale') return '过期价格已隐藏，正在更新';
     const value = sku?.monthly_price;
     if (value === null || value === undefined || value === '' || !Number.isFinite(Number(value))) {
-        return 'Azure 未提供公开价格（不代表免费）';
+        return sku?.price_status === 'ready' ? NO_PUBLIC_PRICE_LABEL : '选择后查询价格';
     }
     const numeric = Number(value);
     return Number.isFinite(numeric)
@@ -577,8 +587,10 @@ function formatCreateSkuDetails(sku) {
         `可用区：${(sku.availability_zones || []).join('、') || '-'}`,
     ];
     if (sku?.price_status === 'loading') details.push('价格加载中，请稍候');
+    else if (sku?.price_status === 'pending') details.push('该地区价格正在后台缓存；已有价格可继续使用');
+    else if (sku?.price_status === 'stale') details.push('过期价格已隐藏，后台正在重新获取');
     else if (sku?.price_status === 'error') details.push('价格暂时无法获取，请稍后重试；实际费用以 Azure Portal、合同价或账单为准');
-    else if (!hasPublicMonthlyPrice(sku)) details.push(NO_PUBLIC_PRICE_DETAIL);
+    else if (sku?.price_status === 'ready' && !hasPublicMonthlyPrice(sku)) details.push(NO_PUBLIC_PRICE_DETAIL);
     if (sku.restriction_reasons && sku.restriction_reasons.length) {
         details.push(`限制：${sku.restriction_reasons.join('、')}`);
     }
@@ -653,7 +665,7 @@ function bindSkuItemSelection(item) {
 }
 
 function updateSkuItemAvailability(item, sku) {
-    const disabled = !isSelectableSku(sku) || !hasPublicMonthlyPrice(sku);
+    const disabled = !isSelectableSku(sku);
     item.classList.toggle('disabled', disabled);
     item.title = formatCreateSkuDetails(sku);
     item.onclick = disabled ? null : item.onclick;
@@ -665,45 +677,97 @@ function applySkuPrices(prices) {
     (prices || []).forEach(sku => {
         const name = String(sku.name || '').toLowerCase();
         if (!name) return;
-        skuDataByName[name] = { ...(skuDataByName[name] || {}), ...sku, price_status: 'ready' };
+        const expired = sku.price_status === 'stale';
+        skuDataByName[name] = {
+            ...(skuDataByName[name] || {}),
+            ...sku,
+            hourly_price: expired ? null : sku.hourly_price,
+            monthly_price: expired ? null : sku.monthly_price,
+            price_updated_at: expired ? null : sku.price_updated_at,
+            price_status: expired ? 'pending' : (sku.price_status || 'ready'),
+        };
     });
     document.querySelectorAll('[data-sku-name]').forEach(item => {
         const sku = skuDataByName[item.dataset.skuName.toLowerCase()];
         if (sku) {
             item.textContent = formatCreateSkuLabel(sku);
             updateSkuItemAvailability(item, sku);
-            if (!isSelectableSku(sku) || !hasPublicMonthlyPrice(sku)) item.classList.remove('selected');
+            if (!isSelectableSku(sku)) item.classList.remove('selected');
         }
     });
     const hiddenInput = document.getElementById('sku-input-hidden');
     const selected = skuDataByName[(hiddenInput?.value || '').toLowerCase()];
     const label = document.getElementById('sku-dropdown-label');
-    if (!selected || !isSelectableSku(selected) || !hasPublicMonthlyPrice(selected)) {
-        if (hiddenInput) hiddenInput.value = '';
-        const firstPricedItem = Array.from(document.querySelectorAll('[data-sku-name]'))
-            .find(item => !item.classList.contains('disabled'));
-        if (firstPricedItem) {
-            firstPricedItem.classList.add('selected');
-            const sku = skuDataByName[firstPricedItem.dataset.skuName.toLowerCase()];
-            selectSkuOption(firstPricedItem.dataset.skuName, formatCreateSkuLabel(sku), sku.architecture === 'arm64');
-        } else if (label) {
-            label.textContent = '没有可用公开价格的规格';
-        }
-    } else if (label) {
+    if (selected && isSelectableSku(selected) && label) {
         label.textContent = formatCreateSkuLabel(selected);
     }
     updateSelectedSkuCapability();
 }
 
-function rememberSkuPrices(location, osType, billing, skus) {
+function rememberSkuPrices(location, osType, billing, skus, complete) {
     const key = skuPriceCacheKey(location, osType, billing);
-    skuPriceCache[key] = (skus || []).map(sku => ({
-        name: sku.name,
-        hourly_price: sku.hourly_price,
-        monthly_price: sku.monthly_price,
-        currency: sku.currency,
-        price_updated_at: sku.price_updated_at,
-    }));
+    const cache = {
+        complete: Boolean(complete),
+        cachedAt: Date.now(),
+        prices: (skus || []).map(sku => ({
+            name: sku.name,
+            hourly_price: sku.hourly_price,
+            monthly_price: sku.monthly_price,
+            currency: sku.currency,
+            price_updated_at: sku.price_updated_at,
+            price_status: sku.price_status,
+        })),
+    };
+    skuPriceCache[key] = cache;
+    clearTimeout(skuPriceExpiryTimers[key]);
+    delete skuPriceExpiryTimers[key];
+    const ttl = billing === 'spot' ? 20 * 60 * 1000 : 6 * 60 * 60 * 1000;
+    const expiries = cache.prices
+        .map(price => Date.parse(price.price_updated_at))
+        .filter(timestamp => Number.isFinite(timestamp))
+        .map(timestamp => timestamp + ttl);
+    if (!expiries.length) return;
+
+    skuPriceExpiryTimers[key] = setTimeout(() => {
+        delete skuPriceExpiryTimers[key];
+        if (skuPriceCache[key] !== cache) return;
+        cache.complete = false;
+        const now = Date.now();
+        cache.prices.forEach(price => {
+            const updatedAt = Date.parse(price.price_updated_at || '');
+            if (Number.isFinite(updatedAt) && now - updatedAt < ttl) return;
+            price.hourly_price = null;
+            price.monthly_price = null;
+            price.price_updated_at = null;
+            price.price_status = 'pending';
+            const sku = skuDataByName[String(price.name || '').toLowerCase()];
+            if (!sku) return;
+            sku.hourly_price = null;
+            sku.monthly_price = null;
+            sku.price_updated_at = null;
+            sku.price_status = 'pending';
+            const item = document.querySelector(`[data-sku-name="${CSS.escape(price.name)}"]`);
+            if (item) {
+                item.textContent = formatCreateSkuLabel(sku);
+                item.title = formatCreateSkuDetails(sku);
+            }
+        });
+        if (getCurrentSkuPriceContext().key === key) refreshSkuPrices();
+    }, Math.max(0, Math.min(...expiries) - Date.now()));
+}
+
+function isSkuPriceEntryFresh(price, billing, now = Date.now()) {
+    const ttl = billing === 'spot' ? 20 * 60 * 1000 : 6 * 60 * 60 * 1000;
+    const updatedAt = Date.parse(price?.price_updated_at || '');
+    return Number.isFinite(updatedAt) && now >= updatedAt && now - updatedAt < ttl;
+}
+
+function isSkuPriceBrowserCacheFresh(cache, billing) {
+    return Boolean(
+        cache?.complete
+        && cache.prices.length
+        && cache.prices.every(price => isSkuPriceEntryFresh(price, billing))
+    );
 }
 
 function getCurrentSkuPriceContext() {
@@ -722,29 +786,38 @@ function cancelStaleSkuPriceRequests(location) {
             skuPriceControllers[key].abort();
         }
     });
+    Object.keys(skuPriceRetryTimers).forEach(key => {
+        if (!key.startsWith(prefix)) {
+            clearTimeout(skuPriceRetryTimers[key]);
+            delete skuPriceRetryTimers[key];
+        }
+    });
 }
 
 function requestSkuPrices(location, osType, billing) {
     const key = skuPriceCacheKey(location, osType, billing);
-    if (skuPriceCache[key]) return Promise.resolve(skuPriceCache[key]);
+    if (isSkuPriceBrowserCacheFresh(skuPriceCache[key], billing)) {
+        return Promise.resolve({ prices: skuPriceCache[key].prices, price_pending: false });
+    }
     if (skuPriceRequests[key]) return skuPriceRequests[key];
 
     const controller = typeof AbortController === 'function' ? new AbortController() : null;
     const fetchOptions = { cache: 'no-store' };
     if (controller) fetchOptions.signal = controller.signal;
-    const timeoutId = controller ? setTimeout(() => controller.abort(), 18000) : null;
+    const timeoutId = controller ? setTimeout(() => controller.abort(), 25000) : null;
     skuPriceControllers[key] = controller;
-    const request = fetch(`/api/sub/{{ subscription.id }}/sku_prices/${location}?os_type=${encodeURIComponent(osType)}&billing_mode=${billing}`, fetchOptions)
+    const request = fetch(`/api/sub/{{ subscription.id }}/sku_prices/${encodeURIComponent(location)}?os_type=${encodeURIComponent(osType)}&billing_mode=${billing}&sku_name=*`, fetchOptions)
         .then(res => readJsonResponse(res, '价格接口未返回 JSON'))
         .then(data => {
             if (data.status !== 'success') throw new Error(data.message || '价格加载失败');
-            if (data.price_error) {
-                const error = new Error(data.price_error);
-                error.code = 'PRICE_UNAVAILABLE';
-                throw error;
-            }
-            rememberSkuPrices(location, osType, billing, data.prices || []);
-            return skuPriceCache[key];
+            const prices = data.prices || [];
+            rememberSkuPrices(location, osType, billing, prices, !data.price_pending);
+            return {
+                prices,
+                price_pending: Boolean(data.price_pending),
+                retry_after_seconds: data.retry_after_seconds,
+                price_error: data.price_error,
+            };
         })
         .finally(() => {
             if (timeoutId) clearTimeout(timeoutId);
@@ -755,24 +828,55 @@ function requestSkuPrices(location, osType, billing) {
     return request;
 }
 
-function refreshSkuPrices() {
+function refreshSkuPrices(retryAttempt = 0) {
     const { location, osType, billing, key } = getCurrentSkuPriceContext();
     if (!location) {
         setCreateDropdownLoading('sku-custom-dropdown', false);
-        return Promise.resolve();
+        return Promise.resolve(false);
     }
     const skuMenu = document.getElementById('sku-dropdown-menu');
     const skuLabel = document.getElementById('sku-dropdown-label');
-    setCreateDropdownLoading('sku-custom-dropdown', true);
-    if (skuMenu) skuMenu.style.visibility = 'hidden';
-    if (skuLabel && document.getElementById('sku-input-hidden')?.value) {
-        skuLabel.textContent = '价格加载中';
+    const contextChanged = displayedSkuPriceContextKey !== key;
+    if (contextChanged) {
+        displayedSkuPriceContextKey = key;
+    }
+    const cacheIsFresh = isSkuPriceBrowserCacheFresh(skuPriceCache[key], billing);
+    if (contextChanged || !cacheIsFresh) {
+        document.querySelectorAll('[data-sku-name]').forEach(item => {
+            const sku = skuDataByName[(item.dataset.skuName || '').toLowerCase()];
+            if (!sku) return;
+            if (!contextChanged && isSkuPriceEntryFresh(sku, billing)) return;
+            sku.hourly_price = null;
+            sku.monthly_price = null;
+            sku.price_updated_at = null;
+            sku.price_status = 'pending';
+            item.textContent = formatCreateSkuLabel(sku);
+            item.title = formatCreateSkuDetails(sku);
+        });
+    }
+    if (isSkuPriceBrowserCacheFresh(skuPriceCache[key], billing)) {
+        applySkuPrices(skuPriceCache[key].prices);
+        return Promise.resolve(true);
     }
     return requestSkuPrices(location, osType, billing)
-        .then(prices => {
+        .then(result => {
             if (getCurrentSkuPriceContext().key === key) {
-                applySkuPrices(prices || []);
+                applySkuPrices(result.prices || []);
                 if (skuMenu) skuMenu.style.visibility = 'visible';
+                if (result.price_pending && skuLabel) skuLabel.title = '当前地区价格正在后台同步；已有缓存价格仍可使用';
+                else if (skuLabel) skuLabel.removeAttribute('title');
+            }
+            if (result.price_pending && retryAttempt < 120) {
+                const retryAfter = Math.max(3, Number(result.retry_after_seconds) || 3);
+                if (!skuPriceRetryTimers[key]) {
+                    return new Promise(resolve => {
+                        skuPriceRetryTimers[key] = setTimeout(() => {
+                            delete skuPriceRetryTimers[key];
+                            if (getCurrentSkuPriceContext().key !== key) return resolve(false);
+                            resolve(refreshSkuPrices(retryAttempt + 1));
+                        }, retryAfter * 1000);
+                    });
+                }
             }
             return true;
         })
@@ -781,44 +885,20 @@ function refreshSkuPrices() {
                 console.warn('Failed to load SKU prices:', error);
             }
             if (getCurrentSkuPriceContext().key === key) {
-                const temporary = error?.code === 'PRICE_UNAVAILABLE' || error?.name === 'AbortError';
-                const message = temporary ? '价格暂时无法获取' : '价格加载失败，请重试';
                 document.querySelectorAll('[data-sku-name]').forEach(item => {
-                    const skuName = item.dataset.skuName || '';
-                    const sku = skuDataByName[skuName.toLowerCase()];
+                    const sku = skuDataByName[(item.dataset.skuName || '').toLowerCase()];
                     if (!sku) return;
-                    sku.price_status = 'error';
-                    item.textContent = formatCreateSkuLabel(sku);
-                    item.title = formatCreateSkuDetails(sku);
+                    if (sku.price_status !== 'ready') {
+                        sku.price_status = 'pending';
+                        item.textContent = formatCreateSkuLabel(sku);
+                        item.title = `${formatCreateSkuDetails(sku)}；后台会继续同步价格`;
+                    }
                 });
-                if (skuLabel) skuLabel.textContent = message;
+                if (skuLabel) skuLabel.title = '价格同步遇到暂时性问题；已有缓存价格仍可使用';
                 if (skuMenu) skuMenu.style.visibility = 'visible';
             }
             return false;
         })
-        .finally(() => {
-            if (getCurrentSkuPriceContext().key === key) {
-                setCreateDropdownLoading('sku-custom-dropdown', false);
-            }
-        });
-}
-
-function prewarmSkuPrices(location, osType, billing) {
-    requestSkuPrices(location, osType, billing)
-        .catch(error => console.warn('Failed to prewarm SKU prices:', error));
-}
-
-function scheduleAlternateSkuPricePrewarm() {
-    const { location, osType, billing } = getCurrentSkuPriceContext();
-    if (!location) return;
-    const alternateBilling = billing === 'spot' ? 'on_demand' : 'spot';
-    if (skuPricePrewarmTimer) clearTimeout(skuPricePrewarmTimer);
-    const key = skuPriceCacheKey(location, osType, billing);
-    skuPricePrewarmTimer = setTimeout(() => {
-        skuPricePrewarmTimer = null;
-        if (getCurrentSkuPriceContext().key !== key) return;
-        prewarmSkuPrices(location, osType, alternateBilling);
-    }, 5000);
 }
 
 function selectImageOption(imgKey, imgLabel, refreshPrices = true) {
@@ -839,7 +919,7 @@ function selectImageOption(imgKey, imgLabel, refreshPrices = true) {
 
     toggleCustomImage(imgKey);
     if (refreshPrices) {
-        refreshSkuPrices().finally(() => scheduleAlternateSkuPricePrewarm());
+        refreshSkuPrices();
     }
 }
 
@@ -1000,7 +1080,7 @@ function renderSkusForLocation(data, location, requestSequence, preserveCatalog 
         }));
 
         skus.forEach(sku => {
-            const displaySku = { ...sku, price_status: 'loading' };
+            const displaySku = { ...sku, price_status: 'pending' };
             skuDataByName[sku.name.toLowerCase()] = displaySku;
             const displayLabel = formatCreateSkuLabel(displaySku);
             const isArm = sku.architecture === 'arm64';
@@ -1085,14 +1165,12 @@ function renderSkusForLocation(data, location, requestSequence, preserveCatalog 
             }
 
             menu.style.visibility = 'visible';
+            setCreateDropdownLoading('sku-custom-dropdown', false);
             if (!foundSelected && firstValidItem) {
                 if (firstValidItemElement) firstValidItemElement.classList.add('selected');
                 selectSkuOption(firstValidItem.name, firstValidItem.label, firstValidItem.isArm);
             } else if (foundSelected) {
                 renderImagesForCurrentSku();
-            }
-            if (labelSpan && hiddenInput && hiddenInput.value) {
-                labelSpan.textContent = '价格加载中';
             }
             refreshSkuPrices().then(priceReady => {
                 if (requestSequence !== locationRequestSequence) return;
@@ -1101,7 +1179,7 @@ function renderSkusForLocation(data, location, requestSequence, preserveCatalog 
                     return;
                 }
                 menu.style.visibility = 'visible';
-            }).finally(() => scheduleAlternateSkuPricePrewarm());
+            });
         };
         schedule(renderChunk);
     }
@@ -1279,10 +1357,6 @@ function handleArchitectureChange(architecture) {
 function handleLocationChange(loc) {
     const requestSequence = ++locationRequestSequence;
     cancelStaleSkuPriceRequests(loc);
-    if (skuPricePrewarmTimer) {
-        clearTimeout(skuPricePrewarmTimer);
-        skuPricePrewarmTimer = null;
-    }
     dynamicImagesData = { x64: [], arm64: [] };
     skuCatalogData = [];
     skuCatalogReady = false;
