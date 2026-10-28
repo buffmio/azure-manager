@@ -30,11 +30,11 @@ Azure Manager 是一个自托管的 Microsoft Azure 多订阅运维管理面板�
   -> /app/data/database.db
 ```
 
-默认 Docker 启动命令使用 1 个 Gunicorn Worker、2 个 Web 线程；应用内 Azure 任务执行器默认使用 2 个线程，使不同 VM 的操作可以并行，同时由同一 VM 的任务预留机制保持串行。为避免长时间 Azure 任务被 Worker 生命周期中断，Gunicorn 不启用按请求自动回收。SQLite 使用 WAL 模式，因此应用运行时必须将数据库文件及其 WAL 伴随文件保存在持久化存储中。
+默认 Compose 部署使用 1 个 Gunicorn Worker、2 个 Web 线程；应用内 Azure 任务执行器默认使用 2 个线程，使不同 VM 的操作可以并行，同时由同一 VM 的任务预留机制保持串行。为避免长时间 Azure 任务被 Worker 生命周期中断，Gunicorn 不启用按请求自动回收。SQLite 使用 WAL 模式，因此应用运行时必须将数据库文件及其 WAL 伴随文件保存在持久化存储中。
 
 ## 环境要求
 
-- Docker Engine 20 或更高版本
+- Docker Engine 20 或更高版本，以及 Docker Compose v2 插件
 - Azure 租户和至少一个订阅
 - 具有目标资源管理权限的 Azure App Registration 或 Service Principal
 - 稳定且随机生成的 SECRET_KEY
@@ -43,34 +43,47 @@ Azure Manager 是一个自托管的 Microsoft Azure 多订阅运维管理面板�
 
 ## 全新部署
 
-以下步骤均在实际运行 Docker 的部署服务器上执行。示例将项目部署到 `/opt/azure-manager`：
+以下步骤均在实际运行 Docker 的部署服务器上执行。示例将项目部署到 `/opt/azure-manager`，并使用 Docker Compose 管理容器和数据卷：
 
 ```bash
-sudo mkdir -p /opt/azure-manager/data
-sudo chown -R 10001:10001 /opt/azure-manager/data
+sudo mkdir -p /opt/azure-manager
+sudo chown "$(id -u):$(id -g)" /opt/azure-manager
+git clone https://github.com/buffmio/azure-manager.git /opt/azure-manager
 cd /opt/azure-manager
-docker build -t azure-manager .
+cp .env.example .env
+chmod 600 .env
 ```
 
-生成一次强随机密钥，并在该数据库目录的整个生命周期内保持不变：
+生成一次强随机密钥，将其填入 `.env` 的 `SECRET_KEY`，并在数据库卷的整个生命周期内保持不变：
 
 ```bash
 openssl rand -hex 32
 ```
 
-正式部署时只将面板端口绑定到服务器本机，交由 Caddy 或 Nginx 对外提供 HTTPS：
+编辑 `.env`，将 `SECRET_KEY` 的示例值替换为生成的随机密钥。其他配置保留默认值即可。
+
+检查 Compose 配置并启动服务：
 
 ```bash
-docker run -d \
-  --name azure-manager \
-  -p 127.0.0.1:8888:8888 \
-  -v /opt/azure-manager/data:/app/data \
-  -e SECRET_KEY="替换为上一步生成的随机密钥" \
-  --restart unless-stopped \
-  azure-manager
+docker compose config --quiet
+docker compose up -d --build
+docker compose ps
 ```
 
-面板后端地址为 `http://127.0.0.1:8888`。不要将 8888 端口直接暴露到公网。当前项目默认 `SESSION_COOKIE_SECURE=1`，通过 HTTPS 反代访问时无需额外设置。
+默认后端地址为 `http://127.0.0.1:8888`，交由 Caddy 或 Nginx 对外提供 HTTPS。不要将 8888 端口直接暴露到公网。当前项目默认 `SESSION_COOKIE_SECURE=1`，通过 HTTPS 反代访问时无需额外设置。
+
+SQLite 数据保存在 Compose 命名卷 `azure-manager-data` 中。`docker compose down` 会保留该卷；不要使用 `docker compose down -v`，否则会删除数据库数据。
+
+### 更新已有部署
+
+在部署目录中拉取代码并重新构建镜像。命名卷会继续保存原有数据库：
+
+```bash
+cd /opt/azure-manager
+git pull --ff-only
+docker compose up -d --build
+docker compose ps
+```
 
 ### Caddy 反向代理
 
@@ -97,22 +110,28 @@ Caddy 反代无需额外环境变量即可工作。以下参数均为可选项�
 | `TRUST_PROXY_HOPS` | `0` | 指定应用前面有几层可信反向代理 |
 | `ENABLE_HSTS` | 未开启 | 让应用返回 HSTS 响应头 |
 
-单层 Caddy 反代无需配置上述可选参数。若需要让登录限流和日志记录真实客户端 IP，可增加：
+单层 Caddy 反代无需配置上述可选参数。若需要让登录限流和日志记录真实客户端 IP，在 `.env` 中设置：
 
-```bash
--e TRUST_PROXY_HOPS=1
+```dotenv
+TRUST_PROXY_HOPS=1
 ```
 
-确认站点及其子域均已启用 HTTPS 后，可增加：
+确认站点及其子域均已启用 HTTPS 后，可在 `.env` 中设置：
 
-```bash
--e ENABLE_HSTS=1
+```dotenv
+ENABLE_HSTS=1
 ```
 
-启用 `TRUST_PROXY_HOPS=1` 前，必须确保 8888 端口只绑定到本机：
+编辑 `.env` 后应用配置：
 
 ```bash
--p 127.0.0.1:8888:8888
+docker compose up -d
+```
+
+启用 `TRUST_PROXY_HOPS=1` 前，必须确保 8888 端口只绑定到本机。`.env` 中应保持：
+
+```dotenv
+AZURE_MANAGER_BIND=127.0.0.1
 ```
 
 否则客户端可能绕过 Caddy 直接访问应用并伪造转发请求头。存在多层可信代理时，`TRUST_PROXY_HOPS` 应按实际层数设置为 1 到 3；协议和来源转发层数不一致时，再分别设置 `TRUST_PROXY_FOR_HOPS` 与 `TRUST_PROXY_PROTO_HOPS`。
@@ -201,9 +220,9 @@ az ad sp create-for-rbac --name azure-manager-sp --role Contributor --scopes /su
 手动备份容器数据时，建议先停止容器：
 
 ```bash
-docker stop azure-manager
-cp -a data data.backup
-docker start azure-manager
+docker compose stop
+docker compose cp app:/app/data ./data.backup
+docker compose start
 ```
 
 ## 项目结构
@@ -216,13 +235,16 @@ azure-manager/
 │   ├── models.py           SQLAlchemy 模型和加密字段
 │   ├── templates/          Jinja 模板
 │   └── static/              CSS 和前端 JavaScript
-├── data/                   持久化 SQLite 数据（Git 忽略）
 ├── screenshots/            脱敏后的文档截图
 ├── Dockerfile
 ├── requirements.txt
 ├── requirements.lock
+├── compose.yaml
+├── .env.example
 └── README.md
 ```
+
+SQLite 数据保存在 Docker 命名卷 `azure-manager-data`，不位于项目目录中。
 
 ## 许可证与致谢
 

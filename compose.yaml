@@ -1,0 +1,27 @@
+services:
+  app:
+    build:
+      context: .
+    image: azure-manager:latest
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${AZURE_MANAGER_BIND:-127.0.0.1}:${AZURE_MANAGER_PORT:-8888}:8888"
+    environment:
+      SECRET_KEY: "${SECRET_KEY:?Set SECRET_KEY in .env}"
+      SESSION_COOKIE_SECURE: "${SESSION_COOKIE_SECURE:-1}"
+      TRUST_PROXY_HOPS: "${TRUST_PROXY_HOPS:-0}"
+      ENABLE_HSTS: "${ENABLE_HSTS:-0}"
+      TZ: "${TZ:-Asia/Shanghai}"
+    volumes:
+      - azure-manager-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8888/login"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  azure-manager-data:
+    name: azure-manager-data
