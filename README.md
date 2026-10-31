@@ -2,48 +2,25 @@
 
 Azure Manager 是一个自托管的 Microsoft Azure 多订阅运维管理面板，使用 Python 3.11、Flask、SQLite 和 Azure 官方管理 SDK 构建，适合个人管理员或小型团队集中管理 Azure 虚拟机及相关资源。
 
-> 本项目面向需要轻量 Azure 管理面板的使用者。正式环境部署前，请自行审查源代码、Azure 权限和网络安全配置。
-
 ![已脱敏的虚拟机列表截图](screenshots/vms-list-sanitized.png)
 
-## 功能概览
+## 功能
 
-- **账户与订阅管理**：管理多个 Azure Service Principal，自动发现并同步订阅，并按订阅筛选面板数据。
-- **虚拟机全生命周期管理**：动态读取 Azure 地域、规格和市场镜像；识别 x64 与 ARM64 架构；支持创建、开机、关机释放、重启、销毁、换盘重装、调整规格、更换公网 IP 和重置管理员凭据。
-- **网络安全组管理**：查看和管理 NSG 入站规则，配置协议、源 CIDR、目标端口范围、优先级和访问动作。
-- **监控与费用**：查看 Azure Monitor CPU、内存、网络和磁盘指标；通过 Azure Cost Management 和 Consumption API 查询月度累计费用。
-- **动态探测、缓存与任务**：将 Azure 动态探测结果缓存到 SQLite，使用持久化任务表记录 Pending、InProgress、Succeeded 和 Failed 状态。
-- **活动通知**：通过顶部即时提示、活动通知抽屉和“活动日志”页面展示操作状态与历史任务。
-- **安全控制**：要求外部注入唯一 SECRET_KEY，加密 Azure 客户端密码和脚本内容，校验 CSRF、限制数据库上传并验证 SQLite 备份。
-
-## 系统架构
-
-应用由 Flask Web 层、Azure 服务层、SQLAlchemy 数据模型和后台任务线程组成：
-
-```text
-浏览器
-  -> HTTPS 反向代理（推荐）
-  -> 127.0.0.1:8888
-  -> Gunicorn
-  -> Flask 路由与后台任务
-  -> Azure 管理 API
-  -> /app/data/database.db
-```
-
-默认 Compose 部署使用 1 个 Gunicorn Worker、2 个 Web 线程；应用内 Azure 任务执行器默认使用 2 个线程，使不同 VM 的操作可以并行，同时由同一 VM 的任务预留机制保持串行。为避免长时间 Azure 任务被 Worker 生命周期中断，Gunicorn 不启用按请求自动回收。SQLite 使用 WAL 模式，因此应用运行时必须将数据库文件及其 WAL 伴随文件保存在持久化存储中。
+- 多订阅管理：管理多个 Azure Service Principal，自动发现、同步并按订阅筛选资源。
+- 虚拟机生命周期：支持创建、开机、关机释放、重启、销毁、换盘重装、升降配、更换公网 IP 和重置管理员凭据（支持 x64 与 ARM64）。
+- 动态探测与缓存：按订阅和地域动态读取可用地域、规格、市场镜像与参考价格，并缓存在本地 SQLite 中。
+- 网络与监控计费：管理 NSG 入站规则，查看 CPU、内存、网络、磁盘监控指标及月度累计费用。
+- 异步任务与日志：耗时操作由后台任务线程执行，通过顶部提示、通知抽屉和活动日志展示进度与结果。
+- 安全与备份：使用 `SECRET_KEY` 加密客户端密码和脚本内容，校验 CSRF，并支持 SQLite 在线备份与校验恢复。
 
 ## 环境要求
 
-- Docker Engine 20 或更高版本，以及 Docker Compose v2 插件
-- Azure 租户和至少一个订阅
-- 具有目标资源管理权限的 Azure App Registration 或 Service Principal
-- 稳定且随机生成的 SECRET_KEY
+- Docker Engine 20+ 及 Docker Compose v2
+- Azure 租户、订阅及具备目标资源管理权限的 Service Principal
 
-项目 Dockerfile 使用 Python 3.11，并从 requirements.lock 安装已锁定版本的 Azure 管理 SDK。锁文件来源、Python 版本和镜像摘要写在文件头；修改 requirements.txt 后必须在受控 Python 3.11 环境重新生成并审查。
+## 部署
 
-## 全新部署
-
-以下步骤均在实际运行 Docker 的部署服务器上执行。示例将项目部署到 `/opt/azure-manager`，并使用 Docker Compose 管理容器和数据卷：
+在部署服务器上克隆仓库并初始化环境变量：
 
 ```bash
 sudo mkdir -p /opt/azure-manager
@@ -54,40 +31,32 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-生成一次强随机密钥，将其填入 `.env` 的 `SECRET_KEY`，并在数据库卷的整个生命周期内保持不变：
+生成随机密钥并填入 `.env` 的 `SECRET_KEY`：
 
 ```bash
 openssl rand -hex 32
 ```
 
-编辑 `.env`，将 `SECRET_KEY` 的示例值替换为生成的随机密钥。其他配置保留默认值即可。
-
-检查 Compose 配置并启动服务：
+构建并启动服务：
 
 ```bash
-docker compose config --quiet
 docker compose up -d --build
 docker compose ps
 ```
 
-默认后端地址为 `http://127.0.0.1:8888`，交由 Caddy 或 Nginx 对外提供 HTTPS。不要将 8888 端口直接暴露到公网。当前项目默认 `SESSION_COOKIE_SECURE=1`，通过 HTTPS 反代访问时无需额外设置。
+默认监听 `127.0.0.1:8888`，请通过宿主机 HTTPS 反向代理对外提供服务，不要将 8888 端口直接暴露到公网。SQLite 数据保存在 Docker 命名卷 `azure-manager-data` 中。
 
-SQLite 数据保存在 Compose 命名卷 `azure-manager-data` 中。`docker compose down` 会保留该卷；不要使用 `docker compose down -v`，否则会删除数据库数据。
-
-### 更新已有部署
-
-在部署目录中拉取代码并重新构建镜像。命名卷会继续保存原有数据库：
+更新已有部署：
 
 ```bash
 cd /opt/azure-manager
 git pull --ff-only
 docker compose up -d --build
-docker compose ps
 ```
 
-### Caddy 反向代理
+## 反向代理与配置
 
-Caddy 运行在 Docker daemon 所在的宿主机上时，最简配置如下。将域名替换为自己的域名：
+宿主机使用 Caddy 时的最简配置（`/etc/caddy/Caddyfile`）：
 
 ```caddyfile
 panel.example.com {
@@ -95,129 +64,43 @@ panel.example.com {
 }
 ```
 
-域名的 DNS 记录应指向服务器公网 IP，并确保公网可访问 80 和 443 端口。Caddy 会自动申请、续期 HTTPS 证书并将 HTTP 重定向到 HTTPS。Caddyfile 配置完成后，可使用以下命令检查并加载：
+校验并加载配置：
 
 ```bash
 sudo caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 
-Caddy 反代无需额外环境变量即可工作。以下参数均为可选项：
+`.env` 可选配置项（修改后执行 `docker compose up -d` 生效）：
 
-| 变量 | 默认值 | 用途 |
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `SESSION_COOKIE_SECURE` | `1` | 只允许登录 Cookie 通过 HTTPS 发送 |
-| `TRUST_PROXY_HOPS` | `0` | 指定应用前面有几层可信反向代理 |
-| `ENABLE_HSTS` | 未开启 | 让应用返回 HSTS 响应头 |
+| `SECRET_KEY` | 必填 | Flask 会话签名及数据库敏感字段加密密钥 |
+| `AZURE_MANAGER_BIND` | `127.0.0.1` | 宿主机监听地址（启用代理转发头时必须仅绑定本机） |
+| `AZURE_MANAGER_PORT` | `8888` | 宿主机监听端口 |
+| `SESSION_COOKIE_SECURE` | `1` | 仅允许通过 HTTPS 发送登录 Cookie |
+| `TRUST_PROXY_HOPS` | `0` | 可信反向代理层数（单层反代需记录真实客户端 IP 时设为 `1`） |
+| `ENABLE_HSTS` | `0` | 确认全站启用 HTTPS 后可设为 `1` 返回 HSTS 响应头 |
+| `TZ` | `Asia/Shanghai` | 容器时区 |
 
-单层 Caddy 反代无需配置上述可选参数。若需要让登录限流和日志记录真实客户端 IP，在 `.env` 中设置：
+## 初始化与 Azure 凭据
 
-```dotenv
-TRUST_PROXY_HOPS=1
-```
+全新数据库首次提交登录表单时，会自动创建第一个管理员账号。
 
-确认站点及其子域均已启用 HTTPS 后，可在 `.env` 中设置：
-
-```dotenv
-ENABLE_HSTS=1
-```
-
-编辑 `.env` 后应用配置：
-
-```bash
-docker compose up -d
-```
-
-启用 `TRUST_PROXY_HOPS=1` 前，必须确保 8888 端口只绑定到本机。`.env` 中应保持：
-
-```dotenv
-AZURE_MANAGER_BIND=127.0.0.1
-```
-
-否则客户端可能绕过 Caddy 直接访问应用并伪造转发请求头。存在多层可信代理时，`TRUST_PROXY_HOPS` 应按实际层数设置为 1 到 3；协议和来源转发层数不一致时，再分别设置 `TRUST_PROXY_FOR_HOPS` 与 `TRUST_PROXY_PROTO_HOPS`。
-
-应用会为所有响应添加基础安全响应头。TLS 应由 Nginx、Caddy 等反向代理终止，并将原始协议正确传递给应用。
-
-### 部署注意事项
-
-- 必须挂载 /app/data，默认数据库路径为 /app/data/database.db。
-- 容器以固定的非 root 用户 UID/GID 10001 运行；宿主机挂载目录必须允许该用户读写，首次部署可执行 `sudo chown -R 10001:10001 data`。
-- 保存 Azure 凭据或脚本后不要更换 SECRET_KEY。同一个密钥同时用于 Flask 会话和数据库字段加密。
-- 容器运行期间不要手动删除 database.db-wal 或 database.db-shm。
-- 手动复制 SQLite 数据库前，应先正常停止应用。
-
-### 可选数据库路径
-
-可以通过 DATABASE_PATH 指定挂载目录中的其他 SQLite 文件：
-
-```bash
--e DATABASE_PATH=/app/data/database.db
-```
-
-## 首次登录
-
-全新数据库首次提交登录表单时，会自动创建第一个管理员账号。登录后：
-
-1. 进入“云账户”。
-2. 添加 Azure Service Principal。
-3. 等待面板发现并同步订阅。
-4. 选择订阅后进入虚拟机或费用页面。
-
-建议为本面板创建专用 Service Principal。不要将客户端密码写入仓库、README、Issue 或截图。
-
-## Azure 凭据与权限
-
-可以使用 Azure CLI 或 Azure Cloud Shell 创建 Service Principal。实际角色应根据需要管理的资源确定。订阅范围的 Contributor 最容易配置，但生产环境建议进一步使用最小权限自定义角色。
-
-示例：
+可使用 Azure CLI 创建专用 Service Principal（生产环境建议按最小权限原则配置自定义角色）：
 
 ```bash
 subscription_id=$(az account show --query id -o tsv)
 az ad sp create-for-rbac --name azure-manager-sp --role Contributor --scopes /subscriptions/$subscription_id
 ```
 
-将命令返回的应用 ID、客户端密码和租户 ID 填入“云账户”页面。资源最终状态仍以 Azure 为准。
-
-## 动态数据和缓存
-
-创建页、重装页和 VM 详情页不依赖固定的地域、规格或镜像列表：
-
-- 地域按订阅从 Azure 动态读取，缓存有效期最长 24 小时。
-- 创建页使用的虚拟机通用规格按订阅和地域缓存在 SQLite，有效期 1 小时；页面不再另存一份浏览器规格缓存。
-- 市场镜像按订阅和地域缓存，区分 x64 与 arm64，有效期最长 24 小时。过期镜像可先返回并后台刷新；创建提交遇到过期镜像时会先刷新并确认所选 URN 仍可用。
-- 虚拟机规格价格独立缓存：按需价格有效期 6 小时，Spot 价格有效期 20 分钟。
-- VM 列表缓存有效期为 15 分钟。强制刷新会创建后台同步任务，并在 Azure 返回后更新缓存。
-- 创建和重装会使用缓存中真实的镜像 URN，并在提交前再次进行架构校验。
-- VM 详情页支持调整规格，可选目标来自 Azure 通过 `list_available_sizes` 返回的该 VM 专属可调整列表，而不是所在地域的通用规格列表。
-- 调整规格可能导致停机；临时磁盘中的数据将丢失，动态公网 IP 地址可能发生变化。操作成功后，原状态为 Running 的 VM 会自动启动，原状态为 Deallocated 的 VM 会保持关机释放状态。
-
-### 虚拟机升降配
-
-在 VM 详情页点击“调整规格”即可查看当前虚拟机可用的目标规格。列表由 Azure 的 `list_available_sizes` 接口按资源组和虚拟机获取，展示 vCPU、内存、临时磁盘和最大数据盘数量；服务端缓存最长 60 秒，弹窗关闭后重新打开时若数据已超过 60 秒会重新加载，提交前会再次向 Azure 实时校验目标规格。
-
-升降配目前仅支持独立 VM 的 `Running` 和 `Deallocated` 状态：
-
-- `Running`：解除分配 VM -> 更新规格 -> 启动 VM，成功后恢复运行。
-- `Deallocated`：解除分配状态下直接更新规格，完成后保持 `Deallocated`。
-- Availability Set、VMSS 和 Dedicated Host 中的 VM 暂不支持自动升降配。
-
-升降配作为后台任务执行，进度和结果可在页面任务提示及“活动日志”中查看。同一台 VM 已有其他操作时会复用原任务，避免重复调用 Azure。Azure 操作失败时，任务会标记为失败并尽力回读实际规格和电源状态，不会用未确认的目标状态覆盖本地缓存。
-
-开机、关机释放、重启和销毁等 VM 生命周期操作也会在活动通知中报告准备、下发 Azure 指令、等待 Azure 完成和状态确认等阶段。不同 VM 的生命周期操作可以并行执行；同一 VM 的重复操作仍会复用现有任务。
-
-调整规格前请确认能够接受停机、临时磁盘数据丢失和动态公网 IP 变化风险，并确认目标规格在该区域和订阅中仍有容量及配额。
-
-## 活动通知和活动日志
-
-长时间运行的操作会先创建持久化任务，再调用 Azure。界面提供顶部即时提示、活动通知抽屉和“活动日志”页面。
-
-“清空活动日志”只会删除允许删除的任务记录，不会删除数据库文件，也不会删除 Azure 账户和缓存数据。关闭通知也不会删除历史活动日志。
+登录面板后进入“云账户”，填入命令返回的应用 ID（`appId`）、客户端密码（`password`）和租户 ID（`tenant`），等待订阅同步完成即可开始管理资源。
 
 ## 备份与恢复
 
-使用“设置 -> 数据库备份”下载 SQLite 备份。恢复前，应用会检查文件格式、大小、SQLite 完整性和基础数据表。请将备份文件与对应的 SECRET_KEY 一起保存；包含加密字段的数据库无法使用其他密钥解密。
+可在面板“设置 -> 数据库备份”中下载或恢复 SQLite 备份，恢复前会自动校验文件格式与基础表完整性。
 
-手动备份容器数据时，建议先停止容器：
+从宿主机手动备份容器数据时，请先停止服务以避免 SQLite WAL 写入冲突：
 
 ```bash
 docker compose stop
@@ -230,21 +113,26 @@ docker compose start
 ```text
 azure-manager/
 ├── azure/
-│   ├── app.py              Flask 路由、任务编排和 API
-│   ├── azure_service.py    Azure SDK 操作和动态探测
-│   ├── models.py           SQLAlchemy 模型和加密字段
-│   ├── templates/          Jinja 模板
-│   └── static/              CSS 和前端 JavaScript
-├── screenshots/            脱敏后的文档截图
+│   ├── app.py              # Flask 路由、任务编排和 API
+│   ├── azure_service.py    # Azure SDK 操作和动态探测
+│   ├── models.py           # SQLAlchemy 模型和加密字段
+│   ├── sku_catalog.py      # 规格目录与零售价格匹配
+│   ├── templates/          # Jinja 模板
+│   └── static/             # CSS 和前端 JavaScript
+├── screenshots/            # 文档截图
 ├── Dockerfile
+├── compose.yaml
 ├── requirements.txt
 ├── requirements.lock
-├── compose.yaml
-├── .env.example
-└── README.md
+└── .env.example
 ```
 
-SQLite 数据保存在 Docker 命名卷 `azure-manager-data`，不位于项目目录中。
+## 注意事项
+
+- 保存 Azure 凭据或脚本后不要更换 `SECRET_KEY`；备份文件必须与对应的 `SECRET_KEY` 一起保存，否则加密字段无法解密。
+- 不要使用 `docker compose down -v`，否则会删除 `azure-manager-data` 数据卷。若改用宿主机目录挂载 `/app/data`，需确保容器运行用户（UID/GID `10001`）可读写。
+- 虚拟机升降配目前仅支持处于 `Running` 或 `Deallocated` 状态的独立 VM；操作会导致停机、临时磁盘数据丢失，动态公网 IP 也可能变化。
+- 正式环境部署前，请自行审查源代码、Azure 权限范围和网络安全配置。
 
 ## 许可证与致谢
 
