@@ -66,7 +66,7 @@
                 <div class="azure-form-row">
                     <label class="azure-form-label" for="location-custom-dropdown">目标地域 <span class="field-hint">Location</span></label>
                     <div class="azure-form-control">
-                        <input type="hidden" name="location" id="location-input-hidden" value="eastasia">
+                        <input type="hidden" name="location" id="location-input-hidden" value="">
                         <div class="custom-dropdown-container" id="location-custom-dropdown">
                             <div class="custom-dropdown-btn is-loading" onclick="toggleCustomDropdown('location-custom-dropdown', event)">
                                 <span id="location-dropdown-label">正在加载地域</span>
@@ -413,8 +413,7 @@ function renderArchitectureOptions(skus, requestSequence) {
 }
 
 
-const LOCATION_CN_PREFIXES = {"eastasia":"中国香港","southeastasia":"新加坡","japanwest":"日本西部","japaneast":"日本东部","koreacentral":"韩国中部","koreasouth":"韩国南部","northcentralus":"美国中北部","westus":"美国西部","westus2":"美国西部 2","westus3":"美国西部 3","centralus":"美国中部","westcentralus":"美国中西部","eastus":"美国东部","eastus2":"美国东部 2","southcentralus":"美国中南部","australiaeast":"澳大利亚东部","australiacentral":"澳大利亚中部","australiasoutheast":"澳大利亚东南部","northeurope":"欧洲北部","westeurope":"欧洲西部","uksouth":"英国南部","ukwest":"英国西部","southafricanorth":"南非北部","canadacentral":"加拿大中部","canadaeast":"加拿大东部","francecentral":"法国中部","germanywestcentral":"德国中西部","norwayeast":"挪威东部","switzerlandnorth":"瑞士北部","uaenorth":"阿联酋北部","qatarcentral":"卡塔尔中部","brazilsouth":"巴西南部","southindia":"印度南部","centralindia":"印度中部","westindia":"印度西部","jioindiawest":"印度西部 Jio","polandcentral":"波兰中部","italynorth":"意大利北部","spaincentral":"西班牙中部","israelcentral":"以色列中部","mexicocentral":"墨西哥中部","australiacentral2":"澳大利亚中部 2","austriaeast":"奥地利东部","belgiumcentral":"比利时中部","brazilsoutheast":"巴西东南部","chilecentral":"智利中部","denmarkeast":"丹麦东部","francesouth":"法国南部","germanynorth":"德国北部","indiasouthcentral":"印度中南部","indonesiacentral":"印度尼西亚中部","jioindiacentral":"印度 Jio 中部","malaysiawest":"马来西亚西部","newzealandnorth":"新西兰北部","norwaywest":"挪威西部","southafricawest":"南非西部","swedencentral":"瑞典中部","switzerlandwest":"瑞士西部","uaecentral":"阿联酋中部"};
-function getLocationDisplayName(location) { const locationName = (location.name || "").toLowerCase(); const prefix = LOCATION_CN_PREFIXES[locationName] || "其他地区"; return `${prefix} - ${location.display_name || location.name}`; }
+function getLocationDisplayName(location) { return location.display_name || location.name; }
 function loadLocations() {
     const menu = document.getElementById("location-dropdown-menu");
     const labelSpan = document.getElementById("location-dropdown-label");

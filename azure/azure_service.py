@@ -375,11 +375,6 @@ class AzureService:
                 "name": name,
                 "display_name": getattr(location, "display_name", None) or name
             })
-        results.sort(key=lambda item: item["display_name"].lower())
-        for index, item in enumerate(results):
-            if item["name"].lower() == "eastasia":
-                results.insert(0, results.pop(index))
-                break
         return results
 
     @classmethod

@@ -2112,7 +2112,7 @@ def create_vm_page():
     if request.method == "POST":
         reject = lambda message: create_vm_request_error(message, subscription_id=subscription.id)
         vm_prefix = request.form.get("name", "").strip().lower()
-        location = request.form.get("location", "eastasia")
+        location = request.form.get("location", "")
         vm_size = request.form.get("vm_size", "Standard_B1s")
         image_urn = request.form.get("image", "").strip()
         custom_image_urn = request.form.get("custom_image_urn", "").strip()
