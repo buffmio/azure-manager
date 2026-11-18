@@ -26,12 +26,14 @@ from azure.mgmt.costmanagement.models import QueryDefinition, TimeframeType, Que
 from azure.mgmt.consumption import ConsumptionManagementClient
 try:
     from .sku_catalog import parse_resource_sku, filter_resize_candidates, normalize_architecture
+    from .image_catalog import discover_dynamic_images, format_image_display_name
 except ImportError:
     from sku_catalog import (
         parse_resource_sku,
         filter_resize_candidates,
         normalize_architecture,
     )
+    from image_catalog import discover_dynamic_images, format_image_display_name
 
 logger = logging.getLogger("azure_service")
 
@@ -120,14 +122,14 @@ PRESET_IMAGES = {
         "arm64": {"publisher": "Canonical", "offer": "0001-com-ubuntu-server-focal", "sku": "20_04-lts-arm64", "version": "latest"}
     },
     "Debian_12": {
-        "name": "Debian 12 (Bookworm)",
+        "name": "Debian 12",
         "os_type": "Linux",
         "supported_archs": ["x64", "arm64"],
         "x64": {"publisher": "Debian", "offer": "debian-12", "sku": "12-gen2", "version": "latest"},
         "arm64": {"publisher": "Debian", "offer": "debian-12", "sku": "12-arm64", "version": "latest"}
     },
     "Debian_11": {
-        "name": "Debian 11 (Bullseye)",
+        "name": "Debian 11",
         "os_type": "Linux",
         "supported_archs": ["x64", "arm64"],
         "x64": {"publisher": "Debian", "offer": "debian-11", "sku": "11-gen2", "version": "latest"},
@@ -568,128 +570,36 @@ class AzureService:
                              subscription_id: str, location: str, force_refresh: bool = False) -> Dict[str, Any]:
         """
         从 Azure Compute API 动态探测指定地域下所有官方主流发行版当前真实活跃的 SKUs (区分 x64 / arm64)
-        自动发现最新版本并自动剔除已废弃/下架的无效版本，杜绝后台重定向
+        固定发行版品牌与 Windows 系列，版本号由 Azure API 动态发现，自动剔除已废弃/下架的无效版本
         """
         loc = location.lower().replace(" ", "")
-        now_ts = time.time()
         cred = cls.get_credential(tenant_id, client_id, client_secret)
         compute_client = ComputeManagementClient(cred, subscription_id)
+        return discover_dynamic_images(compute_client, loc)
 
-        # 待探测的目标官方发布者与产品线
-        discovery_targets = [
-            ("Ubuntu_24_04_LTS", "Canonical", "ubuntu-24_04-lts"),
-            ("Ubuntu_22_04_LTS", "Canonical", "0001-com-ubuntu-server-jammy"),
-            ("Ubuntu_20_04_LTS", "Canonical", "0001-com-ubuntu-server-focal"),
-            ("Debian_12", "Debian", "debian-12"),
-            ("Debian_11", "Debian", "debian-11"),
-            ("AlmaLinux_9", "almalinux", "almalinux-x86_64"),
-            ("AlmaLinux_9_ARM", "almalinux", "almalinux-arm"),
-            ("RockyLinux_9", "resf", "rockylinux-x86_64"),
-            ("Windows_11_Pro", "MicrosoftWindowsDesktop", "windows-11"),
-            ("Windows_10_Pro", "MicrosoftWindowsDesktop", "windows-10"),
-            ("Windows_Server", "MicrosoftWindowsServer", "WindowsServer")
-        ]
-
-        import concurrent.futures
-        discovered_skus = {}
-
-        def scan_target(item):
-            key, pub, off = item
-            try:
-                skus = [s.name for s in compute_client.virtual_machine_images.list_skus(loc, pub, off)]
-                return key, (pub, off, skus)
-            except Exception as e:
-                logger.warning(f"Scan image error for {pub}:{off} in {loc}: {e}")
-                return key, (pub, off, [])
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            for k, val in executor.map(scan_target, discovery_targets):
-                discovered_skus[k] = val
-
-        # 动态组装支持的 x64 与 arm64 真实镜像清单
-        x64_images = []
-        arm64_images = []
-
-        # 1. Ubuntu 24.04
-        pub, off, skus = discovered_skus.get("Ubuntu_24_04_LTS", ("", "", []))
-        if "server" in skus:
-            x64_images.append({"key": "Ubuntu_24_04_LTS", "name": "Ubuntu Server 24.04 LTS", "os_type": "Linux", "urn": f"{pub}:{off}:server:latest"})
-        if "server-arm64" in skus:
-            arm64_images.append({"key": "Ubuntu_24_04_LTS", "name": "Ubuntu Server 24.04 LTS", "os_type": "Linux", "urn": f"{pub}:{off}:server-arm64:latest"})
-
-        # 2. Ubuntu 22.04
-        pub, off, skus = discovered_skus.get("Ubuntu_22_04_LTS", ("", "", []))
-        if "22_04-lts-gen2" in skus or "22_04-lts" in skus:
-            s_sku = "22_04-lts-gen2" if "22_04-lts-gen2" in skus else "22_04-lts"
-            x64_images.append({"key": "Ubuntu_22_04_LTS", "name": "Ubuntu Server 22.04 LTS", "os_type": "Linux", "urn": f"{pub}:{off}:{s_sku}:latest"})
-        if "22_04-lts-arm64" in skus:
-            arm64_images.append({"key": "Ubuntu_22_04_LTS", "name": "Ubuntu Server 22.04 LTS", "os_type": "Linux", "urn": f"{pub}:{off}:22_04-lts-arm64:latest"})
-
-        # 3. Ubuntu 20.04
-        pub, off, skus = discovered_skus.get("Ubuntu_20_04_LTS", ("", "", []))
-        if "20_04-lts-gen2" in skus or "20_04-lts" in skus:
-            s_sku = "20_04-lts-gen2" if "20_04-lts-gen2" in skus else "20_04-lts"
-            x64_images.append({"key": "Ubuntu_20_04_LTS", "name": "Ubuntu Server 20.04 LTS", "os_type": "Linux", "urn": f"{pub}:{off}:{s_sku}:latest"})
-        if "20_04-lts-arm64" in skus:
-            arm64_images.append({"key": "Ubuntu_20_04_LTS", "name": "Ubuntu Server 20.04 LTS", "os_type": "Linux", "urn": f"{pub}:{off}:20_04-lts-arm64:latest"})
-
-        # 4. Debian 12
-        pub, off, skus = discovered_skus.get("Debian_12", ("", "", []))
-        if "12-gen2" in skus or "12" in skus:
-            s_sku = "12-gen2" if "12-gen2" in skus else "12"
-            x64_images.append({"key": "Debian_12", "name": "Debian 12 (Bookworm)", "os_type": "Linux", "urn": f"{pub}:{off}:{s_sku}:latest"})
-        if "12-arm64" in skus:
-            arm64_images.append({"key": "Debian_12", "name": "Debian 12 (Bookworm)", "os_type": "Linux", "urn": f"{pub}:{off}:12-arm64:latest"})
-
-        # 5. Debian 11
-        pub, off, skus = discovered_skus.get("Debian_11", ("", "", []))
-        if "11-gen2" in skus or "11" in skus:
-            s_sku = "11-gen2" if "11-gen2" in skus else "11"
-            x64_images.append({"key": "Debian_11", "name": "Debian 11 (Bullseye)", "os_type": "Linux", "urn": f"{pub}:{off}:{s_sku}:latest"})
-        if "11-backports-arm64-v2" in skus:
-            arm64_images.append({"key": "Debian_11", "name": "Debian 11 (Bullseye)", "os_type": "Linux", "urn": f"{pub}:{off}:11-backports-arm64-v2:latest"})
-
-        # 6. AlmaLinux 9
-        pub_x, off_x, skus_x = discovered_skus.get("AlmaLinux_9", ("", "", []))
-        if "9-gen2" in skus_x or "9-gen1" in skus_x:
-            x64_images.append({"key": "AlmaLinux_9", "name": "AlmaLinux 9", "os_type": "Linux", "urn": f"{pub_x}:{off_x}:9-gen2:latest"})
-        pub_a, off_a, skus_a = discovered_skus.get("AlmaLinux_9_ARM", ("", "", []))
-        if "9-arm-gen2" in skus_a:
-            arm64_images.append({"key": "AlmaLinux_9", "name": "AlmaLinux 9", "os_type": "Linux", "urn": f"{pub_a}:{off_a}:9-arm-gen2:latest"})
-
-        # 7. Rocky Linux 9 (仅 x64 官方存在)
-        pub, off, skus = discovered_skus.get("RockyLinux_9", ("", "", []))
-        if "9-base" in skus:
-            x64_images.append({"key": "RockyLinux_9", "name": "Rocky Linux 9", "os_type": "Linux", "urn": f"{pub}:{off}:9-base:latest"})
-
-        # 8. Windows 11 / 10
-        pub, off, skus = discovered_skus.get("Windows_11_Pro", ("", "", []))
-        win11_pro_skus = [s for s in skus if "pro" in s.lower() and "zh-cn" not in s.lower() and "pron" not in s.lower()]
-        if win11_pro_skus:
-            latest_w11_sku = sorted(win11_pro_skus, reverse=True)[0]
-            x64_images.append({"key": "Windows_11_Pro", "name": f"Windows 11 Pro ({latest_w11_sku.replace('win11-', '').replace('-pro', '').upper()})", "os_type": "Windows", "urn": f"{pub}:{off}:{latest_w11_sku}:latest"})
-
-        pub, off, skus = discovered_skus.get("Windows_10_Pro", ("", "", []))
-        if "win10-22h2-pro-g2" in skus or "win10-22h2-pro" in skus:
-            s_sku = "win10-22h2-pro-g2" if "win10-22h2-pro-g2" in skus else "win10-22h2-pro"
-            x64_images.append({"key": "Windows_10_Pro", "name": "Windows 10 Pro (22H2)", "os_type": "Windows", "urn": f"{pub}:{off}:{s_sku}:latest"})
-
-        # 9. Windows Server
-        pub, off, skus = discovered_skus.get("Windows_Server", ("", "", []))
-        if any("2025-datacenter" in s for s in skus):
-            x64_images.append({"key": "Windows_Server_2025", "name": "Windows Server 2025 Datacenter", "os_type": "Windows", "urn": f"{pub}:{off}:2025-datacenter-azure-edition:latest"})
-        if any("2022-datacenter" in s for s in skus):
-            x64_images.append({"key": "Windows_Server_2022", "name": "Windows Server 2022 Datacenter", "os_type": "Windows", "urn": f"{pub}:{off}:2022-datacenter-azure-edition-smalldisk:latest"})
-        if any("2019-datacenter" in s.lower() for s in skus):
-            x64_images.append({"key": "Windows_Server_2019", "name": "Windows Server 2019 Datacenter", "os_type": "Windows", "urn": f"{pub}:{off}:2019-Datacenter-smalldisk:latest"})
-
-        result = {
-            "location": loc,
-            "x64": x64_images,
-            "arm64": arm64_images,
-            "updated_at": now_ts
-        }
-        return result
+    @staticmethod
+    def _resolve_image_display_name(ir: Any) -> str:
+        """统一解析 VM image_reference 的可读系统名称，优先复用动态镜像命名规则。"""
+        if not ir:
+            return "Linux"
+        dynamic_name = format_image_display_name(
+            getattr(ir, "publisher", None),
+            getattr(ir, "offer", None),
+            getattr(ir, "sku", None),
+        )
+        if dynamic_name:
+            return dynamic_name
+        for _, preset in PRESET_IMAGES.items():
+            x64_c = preset.get("x64", {})
+            arm_c = preset.get("arm64", {})
+            if (x64_c.get("offer") == ir.offer and x64_c.get("sku") == ir.sku) or \
+               (arm_c.get("offer") == ir.offer and arm_c.get("sku") == ir.sku):
+                return preset["name"]
+        if getattr(ir, "offer", None) and getattr(ir, "sku", None):
+            return f"{ir.offer} ({ir.sku})"
+        if getattr(ir, "id", None):
+            return ir.id.split("/")[-1]
+        return "Linux"
 
     @classmethod
     def list_vms(cls, tenant_id: str, client_id: str, client_secret: str, subscription_id: str, force_refresh: bool = False) -> List[Dict[str, Any]]:
@@ -816,20 +726,7 @@ class AzureService:
             if vm.storage_profile:
                 if vm.storage_profile.image_reference:
                     ir = vm.storage_profile.image_reference
-                    matched = False
-                    for _, preset in PRESET_IMAGES.items():
-                        x64_c = preset.get("x64", {})
-                        arm_c = preset.get("arm64", {})
-                        if (x64_c.get("offer") == ir.offer and x64_c.get("sku") == ir.sku) or \
-                           (arm_c.get("offer") == ir.offer and arm_c.get("sku") == ir.sku):
-                            os_display = preset["name"]
-                            matched = True
-                            break
-                    if not matched:
-                        if ir.offer and ir.sku:
-                            os_display = f"{ir.offer} ({ir.sku})"
-                        elif ir.id:
-                            os_display = ir.id.split("/")[-1]
+                    os_display = cls._resolve_image_display_name(ir)
                     if ir.publisher:
                         image_ref = f"{ir.publisher}:{ir.offer}:{ir.sku}:{ir.version}"
                 elif vm.storage_profile.os_disk and vm.storage_profile.os_disk.os_type:
@@ -921,18 +818,7 @@ class AzureService:
         if vm.storage_profile:
             if vm.storage_profile.image_reference:
                 ir = vm.storage_profile.image_reference
-                matched = False
-                for _, preset in PRESET_IMAGES.items():
-                    x64_c = preset.get("x64", {})
-                    arm_c = preset.get("arm64", {})
-                    if (x64_c.get("offer") == ir.offer and x64_c.get("sku") == ir.sku) or \
-                       (arm_c.get("offer") == ir.offer and arm_c.get("sku") == ir.sku):
-                        os_display = preset["name"]
-                        matched = True
-                        break
-                if not matched:
-                    if ir.offer and ir.sku:
-                        os_display = f"{ir.offer} ({ir.sku})"
+                os_display = cls._resolve_image_display_name(ir)
                 if ir.publisher:
                     image_ref = f"{ir.publisher}:{ir.offer}:{ir.sku}:{ir.version}"
                 elif ir.id:
